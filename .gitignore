@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.qrc
+*.ui~
+*.bak
+*.swp
+.DS_Store
+.vscode/
+.idea/
+
