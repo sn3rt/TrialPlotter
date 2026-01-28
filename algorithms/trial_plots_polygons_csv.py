@@ -23,6 +23,8 @@ from qgis.PyQt.QtCore import QVariant
 import math
 import os
 import csv
+import json
+from datetime import datetime
 
 
 CSV_LIMIT_DEFAULT = 150  # fixed limit when CSV splitting is enabled
@@ -399,18 +401,18 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
 
                 A = QgsPointXY(ox, oy)
                 B = QgsPointXY(ox + ux * poly_len, oy + uy * poly_len)
-                Cpt = QgsPointXY(B.x() + vx * poly_wid, B.y() + vy * poly_wid)
+                C = QgsPointXY(B.x() + vx * poly_wid, B.y() + vy * poly_wid)
                 D = QgsPointXY(ox + vx * poly_wid, oy + vy * poly_wid)
 
-                cells[c] = (A, B, Cpt, D)
+                cells[c] = (A, B, C, D)
 
             # Write in driving/numbering order
             for c in drive_cols:
-                A, B, Cpt, D = cells[c]
+                A, B, C, D = cells[c]
                 plot_id += 1
 
                 # Polygon geometry in src CRS (NEVER corner-swapped)
-                ring_local = [A, B, Cpt, D, A]
+                ring_local = [A, B, C, D, A]
                 ring_src = []
                 for pt in ring_local:
                     p_src = from_local_to_src.transform(pt)
@@ -422,17 +424,36 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                 f.setAttributes([plot_id, r, c, ""])
                 pr.addFeature(f)
 
-                # CSV corners in WGS84
-                corners_wgs = []
-                for pt in [A, B, Cpt, D]:
-                    p_wgs = from_local_to_wgs.transform(pt)
-                    corners_wgs.append(QgsPointXY(p_wgs.x(), p_wgs.y()))  # lon,lat
+                # Convert polygon points to WGS84
+                Awgs = from_local_to_wgs.transform(A)      # polygon A
+                Bwgs = from_local_to_wgs.transform(B)      # polygon B (your "left-top")
+                Cwgs = from_local_to_wgs.transform(C)      # polygon C
+                Dwgs = from_local_to_wgs.transform(D)      # polygon D (your "right-bottom")
 
-                # Only swap CSV corners in headland mode on even rows
+                Apt = QgsPointXY(Awgs.x(), Awgs.y())
+                Bpt = QgsPointXY(Bwgs.x(), Bwgs.y())
+                Cpt = QgsPointXY(Cwgs.x(), Cwgs.y())
+                Dpt = QgsPointXY(Dwgs.x(), Dwgs.y())
+
+                # CSV wants: A=left-bottom, D=left-top, B=right-bottom, C=right-top
+                csv_pts = [Apt, Dpt, Cpt, Bpt]  # [A, D, C, B] in polygon letters
+
+                # Headland: even rows drive back -> swap left/right
+                #if route_mode == 1 and (r % 2 == 0):
+                #    # swap A<->B and D<->C in CSV meaning
+                #    # current csv_pts = [A, D, C, B]
+                #    csv_pts = [csv_pts[3], csv_pts[2], csv_pts[1], csv_pts[0]]  # [B, C, D, A]
+                # Headland: even rows drive back -> swap left/right
                 if route_mode == 1 and (r % 2 == 0):
-                    corners_wgs = [corners_wgs[2], corners_wgs[3], corners_wgs[0], corners_wgs[1]]
+                    # swap A<->C and D<->B in CSV meaning
+                    # current csv_pts = [A, D, C, B]
+                    csv_pts = [csv_pts[2], csv_pts[3], csv_pts[0], csv_pts[1]]  # [C, B, A, D]
+              
 
-                Aw, Bw, Cw, Dw = corners_wgs
+                Aw, Bw, Cw, Dw = csv_pts
+
+
+
                 csv_rows.append([
                     plot_id,
                     Aw.y(), Aw.x(),
@@ -520,6 +541,66 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                     w.writerow(row)
 
             feedback.pushInfo(f"CSV written: {out_csv} ({len(chunk)} plots)")
+
+        # ----- Write settings / metadata file -----
+        settings_path = os.path.join(out_root, f"{input_name}_settings.json")
+        settings = {
+            "tool": "TrialPlotter",
+            "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "input_points": {
+                "layer_source": layer.source(),
+                "crs": src_crs.authid(),
+                "num_points": len(feats),
+                "p1": {"x": float(p1_src.x()), "y": float(p1_src.y())},
+                "p2": {"x": float(p2_src.x()), "y": float(p2_src.y())},
+                "p3": (
+                    {"x": float(p3_src.x()), "y": float(p3_src.y())}
+                    if p3_src is not None
+                    else None
+                ),
+            },
+            "local_aeqd": {
+                "lat0": float(lat0),
+                "lon0": float(lon0),
+                "proj4": aeqd_proj,
+            },
+            "parameters_entered": {
+                "N_COLS": int(n_cols),
+                "N_ROWS": int(n_rows),
+                "STEP_LEN": float(step_len),
+                "STEP_ROW": float(step_row),
+                "AUTO_POLY_LEN": bool(auto_poly_len),
+                "POLY_LEN_USER": float(user_poly_len),
+                "POLY_WID": float(poly_wid),
+                "GAPS_AFTER_COL": self.parameterAsString(parameters, self.P_GAPS_AFTER_COL, context),
+                "GAPS_AFTER_ROW": self.parameterAsString(parameters, self.P_GAPS_AFTER_ROW, context),
+                "ROUTE_MODE": "Headland (zigzag)" if route_mode == 1 else "Always forward",
+                "LIMIT_CSV": bool(limit_csv),
+            },
+            "parameters_used": {
+                "POLY_LEN_USED": float(poly_len),
+                "POLY_OFFSET_USED": float(poly_offset),
+                "CSV_LIMIT": int(CSV_LIMIT_DEFAULT) if limit_csv else None,
+            },
+            "direction_vectors_local": {
+                "u_sowing": {"x": float(ux), "y": float(uy)},
+                "v_poly_width": {"x": float(vx), "y": float(vy)},
+                "row_shift_dir": {"x": float(row_dir_x), "y": float(row_dir_y)},
+            },
+            "outputs": {
+                "output_root": out_root,
+                "polygons_shp": polygons_shp,
+                "csv_folder": csv_dir,
+                "csv_files": int(n_files),
+            },
+        }
+
+        try:
+            with open(settings_path, "w", encoding="utf-8") as fset:
+                json.dump(settings, fset, indent=2)
+            feedback.pushInfo(f"Settings saved: {settings_path}")
+        except Exception as e:
+            feedback.reportError(f"Failed to write settings file: {settings_path} ({e})")
 
         return {
             "OUTPUT_FOLDER": out_root,
