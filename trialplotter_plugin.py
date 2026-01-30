@@ -43,7 +43,7 @@ class TrialPlotterPlugin:
 
     def run(self):
         try:
-            alg_id = "wur_trialplotter:trial_plots_polygons_csv"
+            alg_id = "wur_trialplotter:trialplotter_algorithm"
             processing.execAlgorithmDialog(alg_id, {})
         except Exception as e:
             QgsMessageLog.logMessage(str(e), "TrialPlotter", Qgis.Critical)

@@ -4,8 +4,8 @@ from qgis.core import QgsProcessingProvider
 
 class TrialPlotterProvider(QgsProcessingProvider):
     def loadAlgorithms(self):
-        from .algorithms.trial_plots_polygons_csv import TrialPlotsPolygonsCSVAlgorithm
-        self.addAlgorithm(TrialPlotsPolygonsCSVAlgorithm())
+        from .algorithms.trialplotter_algorithm import TrialPlotterAlgorithm
+        self.addAlgorithm(TrialPlotterAlgorithm())
 
     def id(self):
         return "wur_trialplotter"

@@ -27,9 +27,10 @@ import json
 from datetime import datetime
 
 
-CSV_LIMIT_DEFAULT = 150  # fixed limit when CSV splitting is enabled
-AUTO_POLY_LEN_MARGIN_M = 0.25  # total margin between plots along-row
-AUTO_POLY_LEN_HALF_M = AUTO_POLY_LEN_MARGIN_M / 2.0  # 12.5 cm front + 12.5 cm back
+CSV_LIMIT_DEFAULT = 150
+AUTO_POLY_LEN_MARGIN_M = 0.25
+AUTO_POLY_LEN_HALF_M = AUTO_POLY_LEN_MARGIN_M / 2.0
+EPS = 1e-9
 
 
 def _normalize(dx: float, dy: float):
@@ -86,46 +87,15 @@ def _gap_prefix_sum(gaps: dict, idx_1based: int):
     return s
 
 
-class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
-    """
-    Output structure (next to the input points file):
-      <inputfolder>/<inputname>_TRIALPLOTS/
-        polygons/<inputname>_trialplots.shp (+shx/dbf/prj/...)
-        csv/<inputname>_1.csv, <inputname>_2.csv, ...
-
-    Points:
-      P1 = lower-left corner of plot 1
-      P2 = sowing direction
-      P3 (optional) = headland direction reference (controls ROW SHIFT direction only)
-
-    Polygons remain rectangular (90° corners) aligned to sowing direction (P1->P2).
-    Row origins can shift along P3 direction while keeping perpendicular row spacing equal to STEP_ROW.
-
-    Polygon length:
-      - If AUTO_POLY_LEN enabled: POLY_LEN = STEP_LEN - 0.25m (minimum 0.01m)
-      - AND the 0.25m margin is split equally: 12.5cm front + 12.5cm back
-        => polygon is shifted forward by +0.125m along sowing direction u.
-      - If AUTO_POLY_LEN disabled: polygon starts at origin and uses user-entered POLY_LEN.
-
-    CSV splitting:
-      - If enabled: max 150 plots per CSV, but NEVER break a row (baan). (Row length = N_COLS)
-      - If disabled: one CSV with all plots.
-
-    CSV corner swapping:
-      - Only in Headland (zigzag) mode, even rows swap corners A<->C and B<->D for driving direction.
-      - Polygon geometries are NEVER swapped (only numbering order changes).
-    """
-
+class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_INPUT = "INPUT_POINTS"
     P_NCOLS = "N_COLS"
     P_NROWS = "N_ROWS"
     P_STEP_LEN = "STEP_LEN"
     P_STEP_ROW = "STEP_ROW"
-
     P_AUTO_POLY_LEN = "AUTO_POLY_LEN"
     P_POLY_LEN = "POLY_LEN"
     P_POLY_WID = "POLY_WID"
-
     P_GAPS_AFTER_COL = "GAPS_AFTER_COL"
     P_GAPS_AFTER_ROW = "GAPS_AFTER_ROW"
     P_ROUTE_MODE = "ROUTE_MODE"
@@ -200,7 +170,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                 "Polygon width across sowing direction (m)",
                 type=QgsProcessingParameterNumber.Double,
                 minValue=0.01,
-                defaultValue=1.5,
+                defaultValue=1.5
             )
         )
 
@@ -222,7 +192,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterEnum(
                 self.P_ROUTE_MODE,
-                "Driving / numbering mode",
+                "Driving / row direction mode (affects CSV corner order only)",
                 options=["Always forward", "Headland (zigzag)"],
                 defaultValue=1,
             )
@@ -265,7 +235,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
 
         auto_poly_len = self.parameterAsBool(parameters, self.P_AUTO_POLY_LEN, context)
         user_poly_len = self.parameterAsDouble(parameters, self.P_POLY_LEN, context)
-        poly_wid = self.parameterAsDouble(parameters, self.P_POLY_WID, context)
+        poly_wid_user = self.parameterAsDouble(parameters, self.P_POLY_WID, context)
 
         # Auto length + centered offset
         if auto_poly_len:
@@ -280,11 +250,24 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
             poly_offset = 0.0
             feedback.pushInfo(f"Auto polygon length OFF: using POLY_LEN = {poly_len:.3f} m; offset = 0.000 m")
 
-        if poly_wid > step_row:
+        if poly_len - step_len > EPS:
+            raise QgsProcessingException("Polygon length must be <= col spacing (STEP_LEN).")
+
+        if poly_wid_user - step_row > EPS:
             raise QgsProcessingException("Polygon width must be <= row spacing (STEP_ROW).")
 
-        col_gaps = _parse_gap_map(self.parameterAsString(parameters, self.P_GAPS_AFTER_COL, context))
-        row_gaps = _parse_gap_map(self.parameterAsString(parameters, self.P_GAPS_AFTER_ROW, context))
+        poly_wid_used = poly_wid_user
+        if abs(poly_wid_user - step_row) < EPS:
+            poly_wid_used = max(0.01, poly_wid_user - 0.01)
+            feedback.pushInfo(
+                f"Polygon width equals row spacing; using {poly_wid_used:.2f} m to keep a small gap between rows."
+            )
+
+        col_gaps_raw = self.parameterAsString(parameters, self.P_GAPS_AFTER_COL, context)
+        row_gaps_raw = self.parameterAsString(parameters, self.P_GAPS_AFTER_ROW, context)
+        col_gaps = _parse_gap_map(col_gaps_raw)
+        row_gaps = _parse_gap_map(row_gaps_raw)
+
         route_mode = self.parameterAsEnum(parameters, self.P_ROUTE_MODE, context)
         limit_csv = self.parameterAsBool(parameters, self.P_LIMIT_CSV, context)
 
@@ -324,7 +307,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
 
         # u = sowing direction
         ux, uy = _normalize(p2.x() - p1.x(), p2.y() - p1.y())
-        # v = right-hand perpendicular to u (used for polygon width only)
+        # v = right-hand perpendicular to u (polygon width direction)
         vx, vy = _rotate90_cw(ux, uy)
 
         # row_dir = direction used to shift rows (default: perpendicular to u)
@@ -337,9 +320,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
         if p3 is None:
             feedback.pushInfo("2-point mode: rows shift perpendicular to sowing direction.")
         else:
-            # k = headland reference direction
             kx, ky = _normalize(p3.x() - p1.x(), p3.y() - p1.y())
-            # ensure it points to the same side as v
             if (kx * vx + ky * vy) < 0:
                 kx, ky = -kx, -ky
 
@@ -352,7 +333,6 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                     "P3 direction is (almost) parallel to P1->P2. Cannot compute row shift from P3."
                 )
 
-            # scale k so perpendicular distance between u-parallel rows equals step_row
             scale = 1.0 / abs(sin_theta)
             row_dir_x, row_dir_y = kx * scale, ky * scale
 
@@ -382,36 +362,30 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
             t = (r - 1) * step_row + _gap_prefix_sum(row_gaps, r)
 
             base_cols = list(range(1, n_cols + 1))
-            drive_cols = base_cols[:]
-            if route_mode == 1 and (r % 2 == 0):  # Headland: reverse even rows
-                drive_cols.reverse()
 
             # Precompute geometry corners per column (grid-consistent)
             cells = {}
             for c in base_cols:
                 s = (c - 1) * step_len + _gap_prefix_sum(col_gaps, c)
 
-                # Origin of the grid cell (not polygon) in local coords
                 ox_grid = p1.x() + ux * s + row_dir_x * t
                 oy_grid = p1.y() + uy * s + row_dir_y * t
 
-                # Polygon origin: offset forward along u (only when auto length enabled)
                 ox = ox_grid + ux * poly_offset
                 oy = oy_grid + uy * poly_offset
 
                 A = QgsPointXY(ox, oy)
                 B = QgsPointXY(ox + ux * poly_len, oy + uy * poly_len)
-                C = QgsPointXY(B.x() + vx * poly_wid, B.y() + vy * poly_wid)
-                D = QgsPointXY(ox + vx * poly_wid, oy + vy * poly_wid)
-
+                C = QgsPointXY(B.x() + vx * poly_wid_used, B.y() + vy * poly_wid_used)
+                D = QgsPointXY(ox + vx * poly_wid_used, oy + vy * poly_wid_used)
                 cells[c] = (A, B, C, D)
 
-            # Write in driving/numbering order
-            for c in drive_cols:
+            # IMPORTANT: numbering always in base_cols order (no zigzag numbering)
+            for c in base_cols:
                 A, B, C, D = cells[c]
                 plot_id += 1
 
-                # Polygon geometry in src CRS (NEVER corner-swapped)
+                # Polygon geometry in src CRS (never swapped)
                 ring_local = [A, B, C, D, A]
                 ring_src = []
                 for pt in ring_local:
@@ -419,40 +393,32 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                     ring_src.append(QgsPointXY(p_src.x(), p_src.y()))
                 geom = QgsGeometry.fromPolygonXY([ring_src])
 
-                f = QgsFeature(fields)
-                f.setGeometry(geom)
-                f.setAttributes([plot_id, r, c, ""])
-                pr.addFeature(f)
+                feat_out = QgsFeature(fields)
+                feat_out.setGeometry(geom)
+                feat_out.setAttributes([plot_id, r, c, ""])
+                pr.addFeature(feat_out)
 
                 # Convert polygon points to WGS84
-                Awgs = from_local_to_wgs.transform(A)      # polygon A
-                Bwgs = from_local_to_wgs.transform(B)      # polygon B (your "left-top")
-                Cwgs = from_local_to_wgs.transform(C)      # polygon C
-                Dwgs = from_local_to_wgs.transform(D)      # polygon D (your "right-bottom")
+                Awgs = from_local_to_wgs.transform(A)
+                Bwgs = from_local_to_wgs.transform(B)
+                Cwgs = from_local_to_wgs.transform(C)
+                Dwgs = from_local_to_wgs.transform(D)
 
                 Apt = QgsPointXY(Awgs.x(), Awgs.y())
                 Bpt = QgsPointXY(Bwgs.x(), Bwgs.y())
                 Cpt = QgsPointXY(Cwgs.x(), Cwgs.y())
                 Dpt = QgsPointXY(Dwgs.x(), Dwgs.y())
 
-                # CSV wants: A=left-bottom, D=left-top, B=right-bottom, C=right-top
-                csv_pts = [Apt, Dpt, Cpt, Bpt]  # [A, D, C, B] in polygon letters
+                # CSV wants (your rule):
+                # Driving P1->P2: A=LB, B=RB, C=RT, D=LT  (counterclockwise)
+                csv_pts = [Apt, Dpt, Cpt, Bpt]  # yields A=LB, B=RB, C=RT, D=LT in CSV labels
 
-                # Headland: even rows drive back -> swap left/right
-                #if route_mode == 1 and (r % 2 == 0):
-                #    # swap A<->B and D<->C in CSV meaning
-                #    # current csv_pts = [A, D, C, B]
-                #    csv_pts = [csv_pts[3], csv_pts[2], csv_pts[1], csv_pts[0]]  # [B, C, D, A]
-                # Headland: even rows drive back -> swap left/right
+                # Headland (zigzag): even rows drive back -> rotate corners as you specified
                 if route_mode == 1 and (r % 2 == 0):
-                    # swap A<->C and D<->B in CSV meaning
                     # current csv_pts = [A, D, C, B]
                     csv_pts = [csv_pts[2], csv_pts[3], csv_pts[0], csv_pts[1]]  # [C, B, A, D]
-              
 
                 Aw, Bw, Cw, Dw = csv_pts
-
-
 
                 csv_rows.append([
                     plot_id,
@@ -481,7 +447,6 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
             opts
         )
 
-        # QGIS versions differ: return can be (err, msg) or (err, msg, newFile, newLayer)
         if isinstance(res, tuple):
             err = res[0]
             msg = res[1] if len(res) > 1 else ""
@@ -526,7 +491,6 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
 
         for i, chunk in enumerate(chunks, start=1):
             out_csv = os.path.join(csv_dir, f"{input_name}_{i}.csv")
-
             with open(out_csv, mode="w", newline="", encoding="utf-8") as fcsv:
                 w = csv.writer(fcsv)
                 w.writerow([
@@ -537,9 +501,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                     "D(LAT)", "D(LONG)",
                     "Comments"
                 ])
-                for row in chunk:
-                    w.writerow(row)
-
+                w.writerows(chunk)
             feedback.pushInfo(f"CSV written: {out_csv} ({len(chunk)} plots)")
 
         # ----- Write settings / metadata file -----
@@ -571,16 +533,18 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
                 "STEP_ROW": float(step_row),
                 "AUTO_POLY_LEN": bool(auto_poly_len),
                 "POLY_LEN_USER": float(user_poly_len),
-                "POLY_WID": float(poly_wid),
-                "GAPS_AFTER_COL": self.parameterAsString(parameters, self.P_GAPS_AFTER_COL, context),
-                "GAPS_AFTER_ROW": self.parameterAsString(parameters, self.P_GAPS_AFTER_ROW, context),
+                "POLY_WID_USER": float(poly_wid_user),
+                "GAPS_AFTER_COL": col_gaps_raw,
+                "GAPS_AFTER_ROW": row_gaps_raw,
                 "ROUTE_MODE": "Headland (zigzag)" if route_mode == 1 else "Always forward",
                 "LIMIT_CSV": bool(limit_csv),
             },
             "parameters_used": {
                 "POLY_LEN_USED": float(poly_len),
                 "POLY_OFFSET_USED": float(poly_offset),
+                "POLY_WID_USED": float(poly_wid_used),
                 "CSV_LIMIT": int(CSV_LIMIT_DEFAULT) if limit_csv else None,
+                "NUMBERING": "Always forward (never zigzag)",
             },
             "direction_vectors_local": {
                 "u_sowing": {"x": float(ux), "y": float(uy)},
@@ -613,7 +577,7 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
         }
 
     def name(self):
-        return "trial_plots_polygons_csv"
+        return "trialplotter_algorithm"
 
     def displayName(self):
         return "Trial plots: polygons + CSV (2/3 RTK points)"
@@ -625,4 +589,4 @@ class TrialPlotsPolygonsCSVAlgorithm(QgsProcessingAlgorithm):
         return "trialplotter"
 
     def createInstance(self):
-        return TrialPlotsPolygonsCSVAlgorithm()
+        return TrialPlotterAlgorithm()
