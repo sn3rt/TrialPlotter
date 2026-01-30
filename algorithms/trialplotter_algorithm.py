@@ -404,7 +404,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 # required: A=RT, B=LT, C=LB, D=RB
                 if route_mode == 1 and (r % 2 == 0):
                     # current csv_pts corresponds to [LB, RB, RT, LT] in CSV labels
-                    # we want            corresponds to [RT, LT, LB, RB]
+                    # we wan          corresponds to [RT, LT, LB, RB]
                     csv_pts = [csv_pts[2], csv_pts[1], csv_pts[0], csv_pts[3]]
 
                 Aw, Bw, Cw, Dw = csv_pts
