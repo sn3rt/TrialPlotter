@@ -7,6 +7,7 @@ from qgis.core import (
     QgsProcessingParameterString,
     QgsProcessingParameterBoolean,
     QgsProcessingException,
+    QgsProcessingContext,
     QgsFeature,
     QgsFields,
     QgsField,
@@ -22,6 +23,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QVariant
 import math
 import os
+import shutil
 import csv
 import json
 from datetime import datetime
@@ -41,16 +43,10 @@ def _normalize(dx: float, dy: float):
 
 
 def _rotate90_cw(ux: float, uy: float):
-    # 90° clockwise: (x, y) -> (y, -x)
     return uy, -ux
 
 
 def _parse_gap_map(s: str):
-    """
-    Parse: "4:2.0, 10:1.5"
-    Sentinel values meaning "no gaps": "", "-", "none", "null"
-    Indices are 1-based.
-    """
     s = (s or "").strip().lower()
     if not s or s in ("-", "none", "null"):
         return {}
@@ -74,10 +70,6 @@ def _parse_gap_map(s: str):
 
 
 def _gap_prefix_sum(gaps: dict, idx_1based: int):
-    """
-    Sum all gaps for keys < idx_1based (gaps apply AFTER that index).
-    Example: idx=6 includes any gaps after 1..5.
-    """
     if not gaps:
         return 0.0
     s = 0.0
@@ -100,6 +92,10 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_GAPS_AFTER_ROW = "GAPS_AFTER_ROW"
     P_ROUTE_MODE = "ROUTE_MODE"
     P_LIMIT_CSV = "LIMIT_CSV"
+
+    # used to remember what we scheduled, so we can replace safely in postProcessAlgorithm
+    _pending_layer_name = None
+    _pending_layer_path = None
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -221,11 +217,13 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             base_dir = os.path.dirname(src_path)
             input_name = os.path.splitext(os.path.basename(src_path))[0]
 
-        out_root = os.path.join(base_dir, f"{input_name}_TRIALPLOTS")
+        out_root = os.path.join(base_dir, f"{input_name}_trialplots")
         csv_dir = os.path.join(out_root, "csv")
         poly_dir = os.path.join(out_root, "polygons")
-        os.makedirs(csv_dir, exist_ok=True)
-        os.makedirs(poly_dir, exist_ok=True)
+        for d in (csv_dir, poly_dir):
+            if os.path.exists(d):
+                shutil.rmtree(d)
+            os.makedirs(d)
 
         # ----- Read parameters -----
         n_cols = self.parameterAsInt(parameters, self.P_NCOLS, context)
@@ -237,7 +235,6 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         user_poly_len = self.parameterAsDouble(parameters, self.P_POLY_LEN, context)
         poly_wid_user = self.parameterAsDouble(parameters, self.P_POLY_WID, context)
 
-        # Auto length + centered offset
         if auto_poly_len:
             poly_len = max(0.01, step_len - AUTO_POLY_LEN_MARGIN_M)
             poly_offset = AUTO_POLY_LEN_HALF_M
@@ -252,7 +249,6 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
         if poly_len - step_len > EPS:
             raise QgsProcessingException("Polygon length must be <= col spacing (STEP_LEN).")
-
         if poly_wid_user - step_row > EPS:
             raise QgsProcessingException("Polygon width must be <= row spacing (STEP_ROW).")
 
@@ -284,7 +280,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         if not src_crs.isValid():
             raise QgsProcessingException("Input layer CRS is not valid.")
 
-        # ----- Build local AEQD CRS centered on P1 (worldwide meters) -----
+        # ----- Build local AEQD CRS centered on P1 -----
         wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
         to_wgs = QgsCoordinateTransform(src_crs, wgs84, context.transformContext())
         p1_wgs = to_wgs.transform(QgsPointXY(p1_src.x(), p1_src.y()))
@@ -305,17 +301,12 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         p2 = to_local.transform(QgsPointXY(p2_src.x(), p2_src.y()))
         p3 = to_local.transform(QgsPointXY(p3_src.x(), p3_src.y())) if p3_src is not None else None
 
-        # u = sowing direction
+        # u = sowing direction, v = right-hand perpendicular (polygon width direction)
         ux, uy = _normalize(p2.x() - p1.x(), p2.y() - p1.y())
-        # v = right-hand perpendicular to u (polygon width direction)
         vx, vy = _rotate90_cw(ux, uy)
 
-        # row_dir = direction used to shift rows (default: perpendicular to u)
+        # row_dir = shift direction for rows (default: v)
         row_dir_x, row_dir_y = vx, vy
-
-        feedback.pushInfo(f"Output folder: {out_root}")
-        feedback.pushInfo(f"Local CRS: AEQD centered on P1 (lat={lat0:.8f}, lon={lon0:.8f})")
-        feedback.pushInfo(f"u (sowing direction) = ({ux:.6f}, {uy:.6f}), v (polygon width dir) = ({vx:.6f}, {vy:.6f})")
 
         if p3 is None:
             feedback.pushInfo("2-point mode: rows shift perpendicular to sowing direction.")
@@ -327,7 +318,6 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             dot = max(-1.0, min(1.0, ux * kx + uy * ky))
             theta = math.atan2(ux * ky - uy * kx, dot)  # signed
             sin_theta = math.sin(theta)
-
             if abs(sin_theta) < 1e-6:
                 raise QgsProcessingException(
                     "P3 direction is (almost) parallel to P1->P2. Cannot compute row shift from P3."
@@ -336,11 +326,11 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             scale = 1.0 / abs(sin_theta)
             row_dir_x, row_dir_y = kx * scale, ky * scale
 
-            feedback.pushInfo(
-                f"3-point mode: using P3 for row shift. theta={math.degrees(theta):.2f}°, scale=1/|sin(theta)|={scale:.3f}"
-            )
+        feedback.pushInfo(f"Output folder: {out_root}")
+        feedback.pushInfo(f"Local CRS: AEQD centered on P1 (lat={lat0:.8f}, lon={lon0:.8f})")
+        feedback.pushInfo(f"u (sowing direction) = ({ux:.6f}, {uy:.6f}), v (polygon width dir) = ({vx:.6f}, {vy:.6f})")
 
-        # ----- Create an in-memory polygon layer (export to shapefile) -----
+        # ----- Create in-memory polygon layer -----
         fields = QgsFields()
         fields.append(QgsField("plot_id", QVariant.Int))
         fields.append(QgsField("row", QVariant.Int))
@@ -360,10 +350,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
         for r in range(1, n_rows + 1):
             t = (r - 1) * step_row + _gap_prefix_sum(row_gaps, r)
-
             base_cols = list(range(1, n_cols + 1))
 
-            # Precompute geometry corners per column (grid-consistent)
             cells = {}
             for c in base_cols:
                 s = (c - 1) * step_len + _gap_prefix_sum(col_gaps, c)
@@ -380,12 +368,11 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 D = QgsPointXY(ox + vx * poly_wid_used, oy + vy * poly_wid_used)
                 cells[c] = (A, B, C, D)
 
-            # IMPORTANT: numbering always in base_cols order (no zigzag numbering)
+            # numbering ALWAYS forward (no zigzag numbering)
             for c in base_cols:
                 A, B, C, D = cells[c]
                 plot_id += 1
 
-                # Polygon geometry in src CRS (never swapped)
                 ring_local = [A, B, C, D, A]
                 ring_src = []
                 for pt in ring_local:
@@ -398,7 +385,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 feat_out.setAttributes([plot_id, r, c, ""])
                 pr.addFeature(feat_out)
 
-                # Convert polygon points to WGS84
+                # WGS84 for CSV
                 Awgs = from_local_to_wgs.transform(A)
                 Bwgs = from_local_to_wgs.transform(B)
                 Cwgs = from_local_to_wgs.transform(C)
@@ -409,14 +396,16 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 Cpt = QgsPointXY(Cwgs.x(), Cwgs.y())
                 Dpt = QgsPointXY(Dwgs.x(), Dwgs.y())
 
-                # CSV wants (your rule):
-                # Driving P1->P2: A=LB, B=RB, C=RT, D=LT  (counterclockwise)
-                csv_pts = [Apt, Dpt, Cpt, Bpt]  # yields A=LB, B=RB, C=RT, D=LT in CSV labels
+                # Your rule:
+                # Driving P1->P2: A=LB, B=RB, C=RT, D=LT
+                csv_pts = [Apt, Dpt, Cpt, Bpt]  # maps to CSV labels A,B,C,D
 
-                # Headland (zigzag): even rows drive back -> rotate corners as you specified
+                # Headland: even rows drive back
+                # required: A=RT, B=LT, C=LB, D=RB
                 if route_mode == 1 and (r % 2 == 0):
-                    # current csv_pts = [A, D, C, B]
-                    csv_pts = [csv_pts[2], csv_pts[3], csv_pts[0], csv_pts[1]]  # [C, B, A, D]
+                    # current csv_pts corresponds to [LB, RB, RT, LT] in CSV labels
+                    # we want            corresponds to [RT, LT, LB, RB]
+                    csv_pts = [csv_pts[2], csv_pts[1], csv_pts[0], csv_pts[3]]
 
                 Aw, Bw, Cw, Dw = csv_pts
 
@@ -459,17 +448,15 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(f"Polygons saved: {polygons_shp}")
 
-        # ----- Add/replace polygon layer in project -----
+        # ----- Schedule polygon layer to be loaded on completion (thread-safe) -----
         layer_name = f"{input_name}_trialplots"
-        for lyr in QgsProject.instance().mapLayersByName(layer_name):
-            QgsProject.instance().removeMapLayer(lyr.id())
+        details = QgsProcessingContext.LayerDetails(layer_name, context.project(), "ogr")
+        context.addLayerToLoadOnCompletion(polygons_shp, details)
+        feedback.pushInfo("Polygon layer will be added to the project when the algorithm finishes.")
 
-        poly_layer = QgsVectorLayer(polygons_shp, layer_name, "ogr")
-        if not poly_layer.isValid():
-            feedback.reportError(f"Polygon layer could not be loaded into QGIS: {polygons_shp}")
-        else:
-            QgsProject.instance().addMapLayer(poly_layer)
-            feedback.pushInfo(f"Polygon layer '{layer_name}' added to project.")
+        # remember for postProcessAlgorithm
+        self._pending_layer_name = layer_name
+        self._pending_layer_path = polygons_shp
 
         # ----- Write CSV(s) -----
         total = len(csv_rows)
@@ -544,7 +531,6 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "POLY_OFFSET_USED": float(poly_offset),
                 "POLY_WID_USED": float(poly_wid_used),
                 "CSV_LIMIT": int(CSV_LIMIT_DEFAULT) if limit_csv else None,
-                "NUMBERING": "Always forward (never zigzag)",
             },
             "direction_vectors_local": {
                 "u_sowing": {"x": float(ux), "y": float(uy)},
@@ -575,6 +561,86 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             "POLY_LEN_USED": poly_len,
             "POLY_OFFSET_USED": poly_offset,
         }
+
+    
+    def postProcessAlgorithm(self, context, feedback):
+        """
+        Main thread: safe to touch QgsProject and layers.
+        Strategy:
+          - If the layer already exists: try to force-reload it (preferred).
+          - If reload fails or no layer exists: remove duplicates and (re)load from disk.
+        """
+        project = context.project()
+        if not project:
+            return {}
+
+        layer_name = getattr(self, "_pending_layer_name", None)
+        shp_path = getattr(self, "_pending_layer_path", None)
+
+        if not layer_name:
+            return {}
+
+        layers = project.mapLayersByName(layer_name)
+
+        # If multiple with same name: keep only the last one (usually newest)
+        if len(layers) > 1:
+            keep = layers[-1]
+            for lyr in layers[:-1]:
+                project.removeMapLayer(lyr.id())
+            layers = [keep]
+            feedback.pushInfo(f"Removed {len(layers)-1} duplicate layer(s) named '{layer_name}'.")
+
+        if len(layers) == 1:
+            lyr = layers[0]
+
+            # ---- Preferred: force reload the existing layer ----
+            try:
+                dp = lyr.dataProvider()
+                # These calls exist in modern QGIS; some may be no-ops depending on provider
+                if dp is not None:
+                    try:
+                        dp.forceReload()          # not always available
+                    except Exception:
+                        pass
+                    try:
+                        dp.reloadData()           # not always available
+                    except Exception:
+                        pass
+
+                try:
+                    lyr.reload()                  # sometimes available
+                except Exception:
+                    pass
+
+                lyr.triggerRepaint()
+                # Refresh extents (helps after overwrite)
+                try:
+                    lyr.updateExtents()
+                except Exception:
+                    pass
+
+                feedback.pushInfo(f"Reloaded layer '{layer_name}' (in-place).")
+                return {}
+
+            except Exception as e:
+                feedback.reportError(f"Reload failed for '{layer_name}', will remove+re-add. ({e})")
+
+            # ---- Fallback: remove + re-add from disk ----
+            project.removeMapLayer(lyr.id())
+
+        # If we get here: there is no layer loaded, or we removed it as fallback.
+        if shp_path and os.path.exists(shp_path):
+            vl = QgsVectorLayer(shp_path, layer_name, "ogr")
+            if vl.isValid():
+                project.addMapLayer(vl)
+                feedback.pushInfo(f"Layer '{layer_name}' re-added from disk.")
+            else:
+                feedback.reportError(f"Could not load output layer from: {shp_path}")
+        else:
+            feedback.reportError(f"Output shapefile not found: {shp_path}")
+
+        return {}
+
 
     def name(self):
         return "trialplotter_algorithm"

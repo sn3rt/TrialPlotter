@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 import os
 import inspect
-import processing
 
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from qgis.core import Qgis, QgsMessageLog, QgsApplication
+
+import processing
 
 from .provider import TrialPlotterProvider
 
@@ -47,4 +48,8 @@ class TrialPlotterPlugin:
             processing.execAlgorithmDialog(alg_id, {})
         except Exception as e:
             QgsMessageLog.logMessage(str(e), "TrialPlotter", Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "TrialPlotter", f"Could not open algorithm dialog:\n{e}")
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "TrialPlotter",
+                f"Could not open algorithm dialog:\n{e}"
+            )
