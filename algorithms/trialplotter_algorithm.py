@@ -217,7 +217,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             base_dir = os.path.dirname(src_path)
             input_name = os.path.splitext(os.path.basename(src_path))[0]
 
-        out_root = os.path.join(base_dir, f"{input_name}_trialplots")
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        out_root = os.path.join(base_dir, f"{input_name}_trialplots_{stamp}")
         csv_dir = os.path.join(out_root, "csv")
         poly_dir = os.path.join(out_root, "polygons")
         for d in (csv_dir, poly_dir):
