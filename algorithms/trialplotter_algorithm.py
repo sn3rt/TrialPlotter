@@ -647,7 +647,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         return "trialplotter_algorithm"
 
     def displayName(self):
-        return "Trial plots: polygons + CSV (2/3 RTK points)"
+        return "Trialplotter"
 
     def group(self):
         return "TrialPlotter"
