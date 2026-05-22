@@ -1,4 +1,5 @@
 from qgis.core import (
+    Qgis,
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingParameterVectorLayer,
@@ -80,18 +81,55 @@ def _gap_prefix_sum(gaps: dict, idx_1based: int):
     return s
 
 
-def _auto_plot_count_and_step(p1: QgsPointXY, p2: QgsPointXY):
-    distance = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+def _auto_plot_count_and_step(distance: float, label: str):
     if distance <= EPS:
-        raise QgsProcessingException("Cannot auto-calculate plots: P1 and P2 are identical.")
+        raise QgsProcessingException(f"Cannot auto-calculate plots: {label} is zero or negative.")
 
     n_cols = max(1, math.ceil(distance / AUTO_N_COLS_MAX_STEP_M))
     step_len = distance / n_cols
-    return n_cols, step_len, distance
+    return n_cols, step_len
+
+
+def _is_point_layer(layer):
+    try:
+        return layer.geometryType() == QgsWkbTypes.PointGeometry
+    except AttributeError:
+        return layer.geometryType() == Qgis.GeometryType.Point
+
+
+def _is_line_layer(layer):
+    try:
+        return layer.geometryType() == QgsWkbTypes.LineGeometry
+    except AttributeError:
+        return layer.geometryType() == Qgis.GeometryType.Line
+
+
+def _single_line_from_feature(feat):
+    line_geom = feat.geometry()
+    if not line_geom or line_geom.isEmpty():
+        raise QgsProcessingException("Input line geometry is empty.")
+
+    if line_geom.isMultipart():
+        multi_line = [part for part in line_geom.asMultiPolyline() if len(part) >= 2]
+        if len(multi_line) != 1:
+            raise QgsProcessingException(
+                "Input must contain one continuous line part. Multi-part features with multiple parts are not supported."
+            )
+        line = multi_line[0]
+    else:
+        line = line_geom.asPolyline()
+
+    if len(line) < 2:
+        raise QgsProcessingException("Input line must contain at least 2 vertices.")
+
+    return line
 
 
 class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_INPUT = "INPUT_POINTS"
+    P_REVERSE_LINE = "REVERSE_LINE_DIRECTION"
+    P_START_OFFSET = "START_OFFSET_M"
+    P_SIDE_OFFSET = "SIDE_OFFSET_M"
     P_AUTO_NCOLS = "AUTO_N_COLS"
     P_NCOLS = "N_COLS"
     P_NROWS = "N_ROWS"
@@ -113,8 +151,32 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.P_INPUT,
-                "Reference layer (P1=lower-left, P2=sowing direction, optional P3=headland direction)",
-                types=[QgsProcessing.TypeVectorPoint],
+                "Reference layer (points: P1=lower-left, P2=sowing direction, optional P3=headland direction; or one line)",
+                types=[QgsProcessing.TypeVectorPoint, QgsProcessing.TypeVectorLine],
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.P_REVERSE_LINE,
+                "Reverse line direction",
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.P_START_OFFSET,
+                "Offset from line start along line direction (m)",
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.P_SIDE_OFFSET,
+                "Offset from line to the right side (m)",
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.0,
             )
         )
 
@@ -251,6 +313,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         auto_n_cols = self.parameterAsBool(parameters, self.P_AUTO_NCOLS, context)
         user_n_cols = self.parameterAsInt(parameters, self.P_NCOLS, context)
         n_rows = self.parameterAsInt(parameters, self.P_NROWS, context)
+        reverse_line = self.parameterAsBool(parameters, self.P_REVERSE_LINE, context)
+        start_offset = self.parameterAsDouble(parameters, self.P_START_OFFSET, context)
+        side_offset = self.parameterAsDouble(parameters, self.P_SIDE_OFFSET, context)
         user_step_len = self.parameterAsDouble(parameters, self.P_STEP_LEN, context)
         step_row = self.parameterAsDouble(parameters, self.P_STEP_ROW, context)
 
@@ -266,25 +331,42 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         route_mode = self.parameterAsEnum(parameters, self.P_ROUTE_MODE, context)
         limit_csv = self.parameterAsBool(parameters, self.P_LIMIT_CSV, context)
 
-        # ----- Read 2 or 3 points -----
+        # ----- Read reference layer -----
         feats = sorted(layer.getFeatures(), key=lambda f: f.id())
-        if len(feats) not in (2, 3):
-            raise QgsProcessingException("Input must contain exactly 2 or 3 points (P1, P2, optional P3).")
-
-        p1_src = feats[0].geometry().asPoint()
-        p2_src = feats[1].geometry().asPoint()
-        p3_src = feats[2].geometry().asPoint() if len(feats) == 3 else None
 
         src_crs = layer.crs()
         if not src_crs.isValid():
             raise QgsProcessingException("Input layer CRS is not valid.")
 
-        # ----- Build local AEQD CRS centered on P1 -----
+        if _is_point_layer(layer):
+            reference_mode = "point"
+            if len(feats) not in (2, 3):
+                raise QgsProcessingException("Point reference layer must contain exactly 2 or 3 points (P1, P2, optional P3).")
+
+            p1_src = feats[0].geometry().asPoint()
+            p2_src = feats[1].geometry().asPoint()
+            p3_src = feats[2].geometry().asPoint() if len(feats) == 3 else None
+            crs_origin_src = QgsPointXY(p1_src.x(), p1_src.y())
+        elif _is_line_layer(layer):
+            reference_mode = "line"
+            if len(feats) != 1:
+                raise QgsProcessingException("Line reference layer must contain exactly 1 line feature.")
+
+            line = _single_line_from_feature(feats[0])
+            line_start_src = QgsPointXY(line[0])
+            line_end_src = QgsPointXY(line[-1])
+            if reverse_line:
+                line_start_src, line_end_src = line_end_src, line_start_src
+            crs_origin_src = QgsPointXY(line_start_src.x(), line_start_src.y())
+        else:
+            raise QgsProcessingException("Reference layer must be a point or line vector layer.")
+
+        # ----- Build local AEQD CRS centered on reference origin -----
         wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
         to_wgs = QgsCoordinateTransform(src_crs, wgs84, context.transformContext())
-        p1_wgs = to_wgs.transform(QgsPointXY(p1_src.x(), p1_src.y()))
-        lat0 = p1_wgs.y()
-        lon0 = p1_wgs.x()
+        origin_wgs = to_wgs.transform(crs_origin_src)
+        lat0 = origin_wgs.y()
+        lon0 = origin_wgs.x()
 
         aeqd_proj = f"+proj=aeqd +lat_0={lat0} +lon_0={lon0} +datum=WGS84 +units=m +no_defs"
         local_crs = QgsCoordinateReferenceSystem()
@@ -296,15 +378,83 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         from_local_to_src = QgsCoordinateTransform(local_crs, src_crs, context.transformContext())
         from_local_to_wgs = QgsCoordinateTransform(local_crs, wgs84, context.transformContext())
 
-        p1 = to_local.transform(QgsPointXY(p1_src.x(), p1_src.y()))
-        p2 = to_local.transform(QgsPointXY(p2_src.x(), p2_src.y()))
-        p3 = to_local.transform(QgsPointXY(p3_src.x(), p3_src.y())) if p3_src is not None else None
+        if reference_mode == "point":
+            p1 = to_local.transform(QgsPointXY(p1_src.x(), p1_src.y()))
+            p2 = to_local.transform(QgsPointXY(p2_src.x(), p2_src.y()))
+            p3 = to_local.transform(QgsPointXY(p3_src.x(), p3_src.y())) if p3_src is not None else None
 
-        p1_p2_distance = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+            ux, uy = _normalize(p2.x() - p1.x(), p2.y() - p1.y())
+            vx, vy = _rotate90_cw(ux, uy)
+
+            anchor_x, anchor_y = p1.x(), p1.y()
+            reference_distance = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+            auto_distance = reference_distance
+            auto_distance_label = "P1-P2 distance"
+
+            row_dir_x, row_dir_y = vx, vy
+            if p3 is None:
+                feedback.pushInfo("2-point mode: rows shift perpendicular to sowing direction.")
+            else:
+                kx, ky = _normalize(p3.x() - p1.x(), p3.y() - p1.y())
+                if (kx * vx + ky * vy) < 0:
+                    kx, ky = -kx, -ky
+
+                dot = max(-1.0, min(1.0, ux * kx + uy * ky))
+                theta = math.atan2(ux * ky - uy * kx, dot)  # signed
+                sin_theta = math.sin(theta)
+                if abs(sin_theta) < 1e-6:
+                    raise QgsProcessingException(
+                        "P3 direction is (almost) parallel to P1->P2. Cannot compute row shift from P3."
+                    )
+
+                scale = 1.0 / abs(sin_theta)
+                row_dir_x, row_dir_y = kx * scale, ky * scale
+
+            reference_layer_info = {
+                "geometry_type": "point",
+                "layer_source": layer.source(),
+                "crs": src_crs.authid(),
+                "num_points": len(feats),
+                "p1": {"x": float(p1_src.x()), "y": float(p1_src.y())},
+                "p2": {"x": float(p2_src.x()), "y": float(p2_src.y())},
+                "p3": (
+                    {"x": float(p3_src.x()), "y": float(p3_src.y())}
+                    if p3_src is not None
+                    else None
+                ),
+            }
+        else:
+            line_start = to_local.transform(QgsPointXY(line_start_src.x(), line_start_src.y()))
+            line_end = to_local.transform(QgsPointXY(line_end_src.x(), line_end_src.y()))
+
+            ux, uy = _normalize(line_end.x() - line_start.x(), line_end.y() - line_start.y())
+            vx, vy = _rotate90_cw(ux, uy)
+
+            anchor_x = line_start.x() + ux * start_offset + vx * side_offset
+            anchor_y = line_start.y() + uy * start_offset + vy * side_offset
+            reference_distance = math.hypot(line_end.x() - line_start.x(), line_end.y() - line_start.y())
+            auto_distance = reference_distance - start_offset
+            auto_distance_label = "remaining line length after start offset"
+            row_dir_x, row_dir_y = vx, vy
+
+            reference_layer_info = {
+                "geometry_type": "line",
+                "layer_source": layer.source(),
+                "crs": src_crs.authid(),
+                "num_features": len(feats),
+                "num_vertices": len(line),
+                "reverse_line_direction": bool(reverse_line),
+                "start_offset_m": float(start_offset),
+                "side_offset_m": float(side_offset),
+                "start": {"x": float(line_start_src.x()), "y": float(line_start_src.y())},
+                "end": {"x": float(line_end_src.x()), "y": float(line_end_src.y())},
+                "anchor_local": {"x": float(anchor_x), "y": float(anchor_y)},
+            }
+
         if auto_n_cols:
-            n_cols, step_len, p1_p2_distance = _auto_plot_count_and_step(p1, p2)
+            n_cols, step_len = _auto_plot_count_and_step(auto_distance, auto_distance_label)
             feedback.pushInfo(
-                f"Auto nr of plots ON: P1-P2 distance = {p1_p2_distance:.3f} m; "
+                f"Auto nr of plots ON: {auto_distance_label} = {auto_distance:.3f} m; "
                 f"N_COLS = {n_cols}; STEP_LEN = {step_len:.3f} m"
             )
         else:
@@ -338,33 +488,14 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 f"Polygon width equals row spacing; using {poly_wid_used:.2f} m to keep a small gap between rows."
             )
 
-        # u = sowing direction, v = right-hand perpendicular (polygon width direction)
-        ux, uy = _normalize(p2.x() - p1.x(), p2.y() - p1.y())
-        vx, vy = _rotate90_cw(ux, uy)
-
-        # row_dir = shift direction for rows (default: v)
-        row_dir_x, row_dir_y = vx, vy
-
-        if p3 is None:
-            feedback.pushInfo("2-point mode: rows shift perpendicular to sowing direction.")
-        else:
-            kx, ky = _normalize(p3.x() - p1.x(), p3.y() - p1.y())
-            if (kx * vx + ky * vy) < 0:
-                kx, ky = -kx, -ky
-
-            dot = max(-1.0, min(1.0, ux * kx + uy * ky))
-            theta = math.atan2(ux * ky - uy * kx, dot)  # signed
-            sin_theta = math.sin(theta)
-            if abs(sin_theta) < 1e-6:
-                raise QgsProcessingException(
-                    "P3 direction is (almost) parallel to P1->P2. Cannot compute row shift from P3."
-                )
-
-            scale = 1.0 / abs(sin_theta)
-            row_dir_x, row_dir_y = kx * scale, ky * scale
-
         feedback.pushInfo(f"Output folder: {out_root}")
-        feedback.pushInfo(f"Local CRS: AEQD centered on P1 (lat={lat0:.8f}, lon={lon0:.8f})")
+        feedback.pushInfo(f"Reference mode: {reference_mode}")
+        feedback.pushInfo(f"Local CRS: AEQD centered on reference origin (lat={lat0:.8f}, lon={lon0:.8f})")
+        if reference_mode == "line":
+            feedback.pushInfo(f"Line direction reversed: {'yes' if reverse_line else 'no'}")
+            feedback.pushInfo(
+                f"Anchor offsets: start={start_offset:.3f} m along line, side={side_offset:.3f} m to the right"
+            )
         feedback.pushInfo(f"u (sowing direction) = ({ux:.6f}, {uy:.6f}), v (polygon width dir) = ({vx:.6f}, {vy:.6f})")
 
         # ----- Create in-memory polygon layer -----
@@ -393,8 +524,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             for c in base_cols:
                 s = (c - 1) * step_len + _gap_prefix_sum(col_gaps, c)
 
-                ox_grid = p1.x() + ux * s + row_dir_x * t
-                oy_grid = p1.y() + uy * s + row_dir_y * t
+                ox_grid = anchor_x + ux * s + row_dir_x * t
+                oy_grid = anchor_y + uy * s + row_dir_y * t
 
                 ox = ox_grid + ux * poly_offset
                 oy = oy_grid + uy * poly_offset
@@ -533,18 +664,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         settings = {
             "tool": "TrialPlotter",
             "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "input_points": {
-                "layer_source": layer.source(),
-                "crs": src_crs.authid(),
-                "num_points": len(feats),
-                "p1": {"x": float(p1_src.x()), "y": float(p1_src.y())},
-                "p2": {"x": float(p2_src.x()), "y": float(p2_src.y())},
-                "p3": (
-                    {"x": float(p3_src.x()), "y": float(p3_src.y())}
-                    if p3_src is not None
-                    else None
-                ),
-            },
+            "reference_layer": reference_layer_info,
             "local_aeqd": {
                 "lat0": float(lat0),
                 "lon0": float(lon0),
@@ -554,6 +674,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "AUTO_N_COLS": bool(auto_n_cols),
                 "N_COLS": int(user_n_cols),
                 "N_ROWS": int(n_rows),
+                "REVERSE_LINE_DIRECTION": bool(reverse_line),
+                "START_OFFSET_M": float(start_offset),
+                "SIDE_OFFSET_M": float(side_offset),
                 "STEP_LEN": float(user_step_len),
                 "STEP_ROW": float(step_row),
                 "AUTO_POLY_LEN": bool(auto_poly_len),
@@ -567,7 +690,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             "parameters_used": {
                 "N_COLS_USED": int(n_cols),
                 "STEP_LEN_USED": float(step_len),
-                "P1_P2_DISTANCE_M": float(p1_p2_distance),
+                "REFERENCE_DISTANCE_M": float(reference_distance),
+                "AUTO_DISTANCE_M": float(auto_distance),
                 "POLY_LEN_USED": float(poly_len),
                 "POLY_OFFSET_USED": float(poly_offset),
                 "POLY_WID_USED": float(poly_wid_used),
@@ -576,6 +700,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             "direction_vectors_local": {
                 "u_sowing": {"x": float(ux), "y": float(uy)},
                 "v_poly_width": {"x": float(vx), "y": float(vy)},
+                "anchor": {"x": float(anchor_x), "y": float(anchor_y)},
                 "row_shift_dir": {"x": float(row_dir_x), "y": float(row_dir_y)},
             },
             "outputs": {

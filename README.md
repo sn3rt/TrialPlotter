@@ -1,6 +1,6 @@
 # TrialPlotter (QGIS Plugin)
 
-TrialPlotter is a QGIS 3 Processing plugin that generates a grid of rectangular trial-plot polygons and CSV corner coordinates from 2 or 3 RTK points (supports optional headland/zigzag driving and a 3rd point for row-shift direction).
+TrialPlotter is a QGIS 3 Processing plugin that generates a grid of rectangular trial-plot polygons and CSV corner coordinates from a reference layer. The reference can be 2 or 3 RTK points, or one line with optional start/side offsets and reverse direction.
 
 ## Install (from ZIP)
 

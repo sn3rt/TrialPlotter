@@ -64,6 +64,7 @@ class TrialPlotterDialog(QDialog):
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.addWidget(self._build_input_group())
+        content_layout.addWidget(self._build_line_group())
         content_layout.addWidget(self._build_grid_group())
         content_layout.addWidget(self._build_polygon_group())
         content_layout.addWidget(self._build_gaps_group())
@@ -79,10 +80,26 @@ class TrialPlotterDialog(QDialog):
         form = QFormLayout(group)
 
         self.input_layer = QgsMapLayerComboBox()
-        self.input_layer.setFilters(self._point_layer_filter())
+        self.input_layer.setFilters(self._reference_layer_filter())
         form.addRow("Reference layer", self.input_layer)
 
         return group
+
+    def _build_line_group(self):
+        self.line_group = QGroupBox("Line Reference")
+        form = QFormLayout(self.line_group)
+
+        self.reverse_line = QCheckBox("")
+        self.reverse_line.setChecked(False)
+        form.addRow("Reverse line direction", self.reverse_line)
+
+        self.start_offset = self._distance_spin(0.0, minimum=-1000000.0)
+        form.addRow("Offset from line start (m)", self.start_offset)
+
+        self.side_offset = self._distance_spin(0.0, minimum=-1000000.0)
+        form.addRow("Offset to right side (m)", self.side_offset)
+
+        return self.line_group
 
     def _build_grid_group(self):
         group = QGroupBox("Plot Grid")
@@ -150,6 +167,7 @@ class TrialPlotterDialog(QDialog):
         return group
 
     def _connect_signals(self):
+        self.input_layer.layerChanged.connect(self._sync_enabled_fields)
         self.auto_n_cols.toggled.connect(self._sync_enabled_fields)
         self.auto_poly_len.toggled.connect(self._sync_enabled_fields)
         self.button_box.accepted.connect(self._run_algorithm)
@@ -157,10 +175,17 @@ class TrialPlotterDialog(QDialog):
 
     def _set_initial_layer(self):
         layer = self.iface.activeLayer()
-        if layer and hasattr(layer, "geometryType") and layer.geometryType() == self._point_geometry_type():
+        if layer and hasattr(layer, "geometryType") and (
+            layer.geometryType() == self._point_geometry_type()
+            or layer.geometryType() == self._line_geometry_type()
+        ):
             self.input_layer.setLayer(layer)
 
-    def _sync_enabled_fields(self):
+    def _sync_enabled_fields(self, *args):
+        layer = self.input_layer.currentLayer()
+        line_mode = bool(layer and hasattr(layer, "geometryType") and layer.geometryType() == self._line_geometry_type())
+        self.line_group.setVisible(line_mode)
+
         manual_grid = not self.auto_n_cols.isChecked()
         self.n_cols.setEnabled(manual_grid)
         self.step_len.setEnabled(manual_grid)
@@ -170,10 +195,13 @@ class TrialPlotterDialog(QDialog):
     def _parameters(self):
         layer = self.input_layer.currentLayer()
         if layer is None:
-            raise ValueError("Select an RTK point layer.")
+            raise ValueError("Select a reference layer.")
 
         return {
             TrialPlotterAlgorithm.P_INPUT: layer,
+            TrialPlotterAlgorithm.P_REVERSE_LINE: self.reverse_line.isChecked(),
+            TrialPlotterAlgorithm.P_START_OFFSET: self.start_offset.value(),
+            TrialPlotterAlgorithm.P_SIDE_OFFSET: self.side_offset.value(),
             TrialPlotterAlgorithm.P_AUTO_NCOLS: self.auto_n_cols.isChecked(),
             TrialPlotterAlgorithm.P_NCOLS: self.n_cols.value(),
             TrialPlotterAlgorithm.P_NROWS: self.n_rows.value(),
@@ -222,20 +250,20 @@ class TrialPlotterDialog(QDialog):
         return spin
 
     @staticmethod
-    def _distance_spin(value):
+    def _distance_spin(value, minimum=0.01):
         spin = QDoubleSpinBox()
-        spin.setRange(0.01, 1000000.0)
+        spin.setRange(minimum, 1000000.0)
         spin.setDecimals(2)
         spin.setSingleStep(0.1)
         spin.setValue(value)
         return spin
 
     @staticmethod
-    def _point_layer_filter():
+    def _reference_layer_filter():
         try:
-            return QgsMapLayerProxyModel.PointLayer
+            return QgsMapLayerProxyModel.PointLayer | QgsMapLayerProxyModel.LineLayer
         except AttributeError:
-            return QgsMapLayerProxyModel.Filter.PointLayer
+            return QgsMapLayerProxyModel.Filter.PointLayer | QgsMapLayerProxyModel.Filter.LineLayer
 
     @staticmethod
     def _point_geometry_type():
@@ -243,6 +271,13 @@ class TrialPlotterDialog(QDialog):
             return QgsWkbTypes.PointGeometry
         except AttributeError:
             return Qgis.GeometryType.Point
+
+    @staticmethod
+    def _line_geometry_type():
+        try:
+            return QgsWkbTypes.LineGeometry
+        except AttributeError:
+            return Qgis.GeometryType.Line
 
     @staticmethod
     def _ok_button():
