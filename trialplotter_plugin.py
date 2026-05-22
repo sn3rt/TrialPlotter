@@ -6,8 +6,7 @@ from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from qgis.core import Qgis, QgsMessageLog, QgsApplication
 
-import processing
-
+from .trialplotter_dialog import TrialPlotterDialog
 from .provider import TrialPlotterProvider
 
 
@@ -67,12 +66,15 @@ class TrialPlotterPlugin:
 
     def run(self):
         try:
-            alg_id = "wur_trialplotter:trialplotter_algorithm"
-            processing.execAlgorithmDialog(alg_id, {})
+            dialog = TrialPlotterDialog(self.iface, self.iface.mainWindow())
+            if hasattr(dialog, "exec"):
+                dialog.exec()
+            else:
+                dialog.exec_()
         except Exception as e:
             QgsMessageLog.logMessage(str(e), "TrialPlotter", Qgis.Critical)
             QMessageBox.critical(
                 self.iface.mainWindow(),
                 "TrialPlotter",
-                f"Could not open algorithm dialog:\n{e}"
+                f"Could not open TrialPlotter dialog:\n{e}"
             )

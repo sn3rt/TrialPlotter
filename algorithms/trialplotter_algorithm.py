@@ -113,7 +113,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.P_INPUT,
-                "RTK points (P1=lower-left, P2=sowing direction, optional P3=headland direction)",
+                "Reference layer (P1=lower-left, P2=sowing direction, optional P3=headland direction)",
                 types=[QgsProcessing.TypeVectorPoint],
             )
         )
@@ -121,7 +121,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.P_AUTO_NCOLS,
-                "Auto nr of plots (nr per row, nr of rows and plot distance in sowing direction are ignored)",
+                f"Auto nr of plots (maximum {AUTO_N_COLS_MAX_STEP_M:g} m plot distance)",
                 defaultValue=False,
             )
         )
@@ -166,7 +166,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.P_AUTO_POLY_LEN,
-                "Auto polygon length (POLY_LEN = STEP_LEN - 0.25 m; centered 12.5cm front/back)",
+                "Auto polygon length "
+                f"(creates {AUTO_POLY_LEN_MARGIN_M * 100:g} cm space between plots "
+                f"({AUTO_POLY_LEN_HALF_M * 100:g} cm front/back))",
                 defaultValue=True,
             )
         )
@@ -192,7 +194,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterString(
                 self.P_GAPS_AFTER_COL,
-                "Optional gap after plot(s) in sowing direction (e.g. '4:2.0,10:1.0'). Use '-' for none.",
+                "Optional gap(s) after plot in sowing direction (e.g. '4:2.0,10:1.0'). Use '-' for none.",
                 defaultValue="-",
             )
         )
