@@ -19,6 +19,7 @@ from qgis.core import (
     QgsProcessingUtils,
     QgsVectorLayer,
     QgsVectorFileWriter,
+    QgsWkbTypes,
     QgsProject,
 )
 from qgis.PyQt.QtCore import QVariant
@@ -130,6 +131,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_REVERSE_LINE = "REVERSE_LINE_DIRECTION"
     P_START_OFFSET = "START_OFFSET_M"
     P_SIDE_OFFSET = "SIDE_OFFSET_M"
+    P_FLIP_PLOT_SIDE = "FLIP_PLOT_SIDE"
     P_AUTO_NCOLS = "AUTO_N_COLS"
     P_NCOLS = "N_COLS"
     P_NROWS = "N_ROWS"
@@ -159,14 +161,14 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.P_REVERSE_LINE,
-                "Reverse line direction",
+                "Reverse reference",
                 defaultValue=False,
             )
         )
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.P_START_OFFSET,
-                "Offset from line start along line direction (m)",
+                "Offset from start (m)",
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=0.0,
             )
@@ -174,9 +176,17 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.P_SIDE_OFFSET,
-                "Offset from line to the right side (m)",
+                "Offset to side (m)",
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=0.0,
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.P_FLIP_PLOT_SIDE,
+                "Flip plot side",
+                defaultValue=False,
             )
         )
 
@@ -316,6 +326,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         reverse_line = self.parameterAsBool(parameters, self.P_REVERSE_LINE, context)
         start_offset = self.parameterAsDouble(parameters, self.P_START_OFFSET, context)
         side_offset = self.parameterAsDouble(parameters, self.P_SIDE_OFFSET, context)
+        flip_plot_side = self.parameterAsBool(parameters, self.P_FLIP_PLOT_SIDE, context)
         user_step_len = self.parameterAsDouble(parameters, self.P_STEP_LEN, context)
         step_row = self.parameterAsDouble(parameters, self.P_STEP_ROW, context)
 
@@ -343,9 +354,13 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             if len(feats) not in (2, 3):
                 raise QgsProcessingException("Point reference layer must contain exactly 2 or 3 points (P1, P2, optional P3).")
 
-            p1_src = feats[0].geometry().asPoint()
-            p2_src = feats[1].geometry().asPoint()
+            p1_input_src = feats[0].geometry().asPoint()
+            p2_input_src = feats[1].geometry().asPoint()
             p3_src = feats[2].geometry().asPoint() if len(feats) == 3 else None
+            p1_src = p1_input_src
+            p2_src = p2_input_src
+            if reverse_line:
+                p1_src, p2_src = p2_src, p1_src
             crs_origin_src = QgsPointXY(p1_src.x(), p1_src.y())
         elif _is_line_layer(layer):
             reference_mode = "line"
@@ -382,11 +397,11 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             p1 = to_local.transform(QgsPointXY(p1_src.x(), p1_src.y()))
             p2 = to_local.transform(QgsPointXY(p2_src.x(), p2_src.y()))
             p3 = to_local.transform(QgsPointXY(p3_src.x(), p3_src.y())) if p3_src is not None else None
+            p1_input = to_local.transform(QgsPointXY(p1_input_src.x(), p1_input_src.y()))
 
             ux, uy = _normalize(p2.x() - p1.x(), p2.y() - p1.y())
             vx, vy = _rotate90_cw(ux, uy)
 
-            anchor_x, anchor_y = p1.x(), p1.y()
             reference_distance = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
             auto_distance = reference_distance
             auto_distance_label = "P1-P2 distance"
@@ -395,7 +410,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             if p3 is None:
                 feedback.pushInfo("2-point mode: rows shift perpendicular to sowing direction.")
             else:
-                kx, ky = _normalize(p3.x() - p1.x(), p3.y() - p1.y())
+                kx, ky = _normalize(p3.x() - p1_input.x(), p3.y() - p1_input.y())
                 if (kx * vx + ky * vy) < 0:
                     kx, ky = -kx, -ky
 
@@ -410,11 +425,23 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 scale = 1.0 / abs(sin_theta)
                 row_dir_x, row_dir_y = kx * scale, ky * scale
 
+            if flip_plot_side:
+                row_dir_x, row_dir_y = -row_dir_x, -row_dir_y
+
+            anchor_x = p1.x() + ux * start_offset + row_dir_x * side_offset
+            anchor_y = p1.y() + uy * start_offset + row_dir_y * side_offset
+
             reference_layer_info = {
                 "geometry_type": "point",
                 "layer_source": layer.source(),
                 "crs": src_crs.authid(),
                 "num_points": len(feats),
+                "reverse_reference": bool(reverse_line),
+                "start_offset_m": float(start_offset),
+                "side_offset_m": float(side_offset),
+                "flip_plot_side": bool(flip_plot_side),
+                "input_p1": {"x": float(p1_input_src.x()), "y": float(p1_input_src.y())},
+                "input_p2": {"x": float(p2_input_src.x()), "y": float(p2_input_src.y())},
                 "p1": {"x": float(p1_src.x()), "y": float(p1_src.y())},
                 "p2": {"x": float(p2_src.x()), "y": float(p2_src.y())},
                 "p3": (
@@ -429,13 +456,15 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
             ux, uy = _normalize(line_end.x() - line_start.x(), line_end.y() - line_start.y())
             vx, vy = _rotate90_cw(ux, uy)
+            row_dir_x, row_dir_y = vx, vy
+            if flip_plot_side:
+                row_dir_x, row_dir_y = -row_dir_x, -row_dir_y
 
-            anchor_x = line_start.x() + ux * start_offset + vx * side_offset
-            anchor_y = line_start.y() + uy * start_offset + vy * side_offset
+            anchor_x = line_start.x() + ux * start_offset + row_dir_x * side_offset
+            anchor_y = line_start.y() + uy * start_offset + row_dir_y * side_offset
             reference_distance = math.hypot(line_end.x() - line_start.x(), line_end.y() - line_start.y())
             auto_distance = reference_distance - start_offset
             auto_distance_label = "remaining line length after start offset"
-            row_dir_x, row_dir_y = vx, vy
 
             reference_layer_info = {
                 "geometry_type": "line",
@@ -443,9 +472,10 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "crs": src_crs.authid(),
                 "num_features": len(feats),
                 "num_vertices": len(line),
-                "reverse_line_direction": bool(reverse_line),
+                "reverse_reference": bool(reverse_line),
                 "start_offset_m": float(start_offset),
                 "side_offset_m": float(side_offset),
+                "flip_plot_side": bool(flip_plot_side),
                 "start": {"x": float(line_start_src.x()), "y": float(line_start_src.y())},
                 "end": {"x": float(line_end_src.x()), "y": float(line_end_src.y())},
                 "anchor_local": {"x": float(anchor_x), "y": float(anchor_y)},
@@ -492,10 +522,11 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(f"Reference mode: {reference_mode}")
         feedback.pushInfo(f"Local CRS: AEQD centered on reference origin (lat={lat0:.8f}, lon={lon0:.8f})")
         if reference_mode == "line":
-            feedback.pushInfo(f"Line direction reversed: {'yes' if reverse_line else 'no'}")
+            feedback.pushInfo(f"Reference reversed: {'yes' if reverse_line else 'no'}")
             feedback.pushInfo(
-                f"Anchor offsets: start={start_offset:.3f} m along line, side={side_offset:.3f} m to the right"
+                f"Anchor offsets: start={start_offset:.3f} m, side={side_offset:.3f} m"
             )
+        feedback.pushInfo(f"Plot side flipped: {'yes' if flip_plot_side else 'no'}")
         feedback.pushInfo(f"u (sowing direction) = ({ux:.6f}, {uy:.6f}), v (polygon width dir) = ({vx:.6f}, {vy:.6f})")
 
         # ----- Create in-memory polygon layer -----
@@ -532,8 +563,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
                 A = QgsPointXY(ox, oy)
                 B = QgsPointXY(ox + ux * poly_len, oy + uy * poly_len)
-                C = QgsPointXY(B.x() + vx * poly_wid_used, B.y() + vy * poly_wid_used)
-                D = QgsPointXY(ox + vx * poly_wid_used, oy + vy * poly_wid_used)
+                C = QgsPointXY(B.x() + row_dir_x * poly_wid_used, B.y() + row_dir_y * poly_wid_used)
+                D = QgsPointXY(ox + row_dir_x * poly_wid_used, oy + row_dir_y * poly_wid_used)
                 cells[c] = (A, B, C, D)
 
             # numbering ALWAYS forward (no zigzag numbering)
@@ -674,9 +705,10 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "AUTO_N_COLS": bool(auto_n_cols),
                 "N_COLS": int(user_n_cols),
                 "N_ROWS": int(n_rows),
-                "REVERSE_LINE_DIRECTION": bool(reverse_line),
+                "REVERSE_REFERENCE": bool(reverse_line),
                 "START_OFFSET_M": float(start_offset),
                 "SIDE_OFFSET_M": float(side_offset),
+                "FLIP_PLOT_SIDE": bool(flip_plot_side),
                 "STEP_LEN": float(user_step_len),
                 "STEP_ROW": float(step_row),
                 "AUTO_POLY_LEN": bool(auto_poly_len),

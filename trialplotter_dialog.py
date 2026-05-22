@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import processing
 
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -9,6 +10,7 @@ from qgis.PyQt.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -26,6 +28,9 @@ from .algorithms.trialplotter_algorithm import (
     AUTO_POLY_LEN_MARGIN_M,
     TrialPlotterAlgorithm,
 )
+
+
+FIELD_WIDTH = 340
 
 
 def _meters_label(value):
@@ -77,92 +82,105 @@ class TrialPlotterDialog(QDialog):
 
     def _build_input_group(self):
         group = QGroupBox("Input")
-        form = QFormLayout(group)
+        form = self._form_layout(group)
 
         self.input_layer = QgsMapLayerComboBox()
         self.input_layer.setFilters(self._reference_layer_filter())
-        form.addRow("Reference layer", self.input_layer)
+        self._set_field_width(self.input_layer)
+        self._add_row(form, "Reference layer", self.input_layer)
 
         return group
 
     def _build_line_group(self):
-        self.line_group = QGroupBox("Line Reference")
-        form = QFormLayout(self.line_group)
+        self.line_group = QGroupBox("Reference")
+        form = self._form_layout(self.line_group)
 
         self.reverse_line = QCheckBox("")
         self.reverse_line.setChecked(False)
-        form.addRow("Reverse line direction", self.reverse_line)
+        self._set_field_width(self.reverse_line)
+        self._add_row(form, "Reverse reference", self.reverse_line)
 
         self.start_offset = self._distance_spin(0.0, minimum=-1000000.0)
-        form.addRow("Offset from line start (m)", self.start_offset)
+        self._add_row(form, "Offset from start (m)", self.start_offset)
 
         self.side_offset = self._distance_spin(0.0, minimum=-1000000.0)
-        form.addRow("Offset to right side (m)", self.side_offset)
+        self._add_row(form, "Offset to side (m)", self.side_offset)
 
         return self.line_group
 
     def _build_grid_group(self):
         group = QGroupBox("Plot Grid")
-        form = QFormLayout(group)
+        form = self._form_layout(group)
+
+        self.flip_plot_side = QCheckBox("")
+        self.flip_plot_side.setChecked(False)
+        self._set_field_width(self.flip_plot_side)
+        self._add_row(form, "Flip plot side", self.flip_plot_side)
 
         self.auto_n_cols = QCheckBox(
             f"(maximum {_meters_label(AUTO_N_COLS_MAX_STEP_M)} plot distance)"
         )
         self.auto_n_cols.setChecked(False)
-        form.addRow("Auto nr of plots", self.auto_n_cols)
+        self._set_field_width(self.auto_n_cols)
+        self._add_row(form, "Auto nr of plots", self.auto_n_cols)
 
         self.n_cols = self._int_spin(1, 100000, 10)
-        form.addRow("Plots per sowing line (columns)", self.n_cols)
+        self._add_row(form, "Plots per row", self.n_cols)
 
         self.n_rows = self._int_spin(1, 100000, 4)
-        form.addRow("Number of sowing lines (rows)", self.n_rows)
+        self._add_row(form, "Number of rows", self.n_rows)
 
         self.step_len = self._distance_spin(1.0)
-        form.addRow("Plot distance in sowing direction (m)", self.step_len)
+        self._add_row(form, "Plot distance in row (m)", self.step_len)
 
         self.step_row = self._distance_spin(1.5)
-        form.addRow("Plot distance across to sowing direction (m)", self.step_row)
+        self._add_row(form, "Plot distance across rows (m)", self.step_row)
 
         return group
 
     def _build_polygon_group(self):
         group = QGroupBox("Polygon Size")
-        form = QFormLayout(group)
+        form = self._form_layout(group)
 
         self.auto_poly_len = QCheckBox(
-            f"(creates {_centimeters_label(AUTO_POLY_LEN_MARGIN_M)} space between plots "
-            f"({_centimeters_label(AUTO_POLY_LEN_HALF_M)} front/back))"
+            f"(cuts {_centimeters_label(AUTO_POLY_LEN_MARGIN_M)} of plots, "
+            f"front & back {_centimeters_label(AUTO_POLY_LEN_HALF_M)})"
         )
         self.auto_poly_len.setChecked(True)
-        form.addRow("Auto polygon length", self.auto_poly_len)
+        self._set_field_width(self.auto_poly_len)
+        self._add_row(form, "Auto polygon length", self.auto_poly_len)
 
         self.poly_len = self._distance_spin(1.0)
-        form.addRow("Polygon length in sowing direction (m)", self.poly_len)
+        self._add_row(form, "Polygon length in row (m)", self.poly_len)
 
         self.poly_wid = self._distance_spin(1.5)
-        form.addRow("Polygon width across sowing direction (m)", self.poly_wid)
+        self._add_row(form, "Polygon width across row (m)", self.poly_wid)
 
         return group
 
     def _build_gaps_group(self):
         group = QGroupBox("Gaps And Driving")
-        form = QFormLayout(group)
+        form = self._form_layout(group)
 
         self.gaps_after_col = QLineEdit("-")
-        form.addRow("Optional gap(s) after plot in sowing direction", self.gaps_after_col)
+        self._set_field_width(self.gaps_after_col)
+        self._add_row(form, "Optional gap(s) after plot in sowing direction", self.gaps_after_col)
 
         self.gaps_after_row = QLineEdit("-")
-        form.addRow("Optional gap after row(s)", self.gaps_after_row)
+        self._set_field_width(self.gaps_after_row)
+        self._add_row(form, "Optional gap after row(s)", self.gaps_after_row)
 
         self.route_mode = QComboBox()
         self.route_mode.addItem("Always forward", 0)
         self.route_mode.addItem("Headland (zigzag)", 1)
         self.route_mode.setCurrentIndex(1)
-        form.addRow("Driving / row direction mode", self.route_mode)
+        self._set_field_width(self.route_mode)
+        self._add_row(form, "Driving / row direction mode", self.route_mode)
 
         self.limit_csv = QCheckBox("(max 150 plots, keep whole rows together)")
         self.limit_csv.setChecked(True)
-        form.addRow("Split CSV files", self.limit_csv)
+        self._set_field_width(self.limit_csv)
+        self._add_row(form, "Split CSV files", self.limit_csv)
 
         return group
 
@@ -183,8 +201,11 @@ class TrialPlotterDialog(QDialog):
 
     def _sync_enabled_fields(self, *args):
         layer = self.input_layer.currentLayer()
-        line_mode = bool(layer and hasattr(layer, "geometryType") and layer.geometryType() == self._line_geometry_type())
-        self.line_group.setVisible(line_mode)
+        reference_mode = bool(layer and hasattr(layer, "geometryType") and (
+            layer.geometryType() == self._point_geometry_type()
+            or layer.geometryType() == self._line_geometry_type()
+        ))
+        self.line_group.setVisible(reference_mode)
 
         manual_grid = not self.auto_n_cols.isChecked()
         self.n_cols.setEnabled(manual_grid)
@@ -202,6 +223,7 @@ class TrialPlotterDialog(QDialog):
             TrialPlotterAlgorithm.P_REVERSE_LINE: self.reverse_line.isChecked(),
             TrialPlotterAlgorithm.P_START_OFFSET: self.start_offset.value(),
             TrialPlotterAlgorithm.P_SIDE_OFFSET: self.side_offset.value(),
+            TrialPlotterAlgorithm.P_FLIP_PLOT_SIDE: self.flip_plot_side.isChecked(),
             TrialPlotterAlgorithm.P_AUTO_NCOLS: self.auto_n_cols.isChecked(),
             TrialPlotterAlgorithm.P_NCOLS: self.n_cols.value(),
             TrialPlotterAlgorithm.P_NROWS: self.n_rows.value(),
@@ -240,13 +262,13 @@ class TrialPlotterDialog(QDialog):
             "TrialPlotter",
             "Trial plots generated." + ("\n\n" + "\n".join(details) if details else ""),
         )
-        self.accept()
 
     @staticmethod
     def _int_spin(minimum, maximum, value):
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
+        TrialPlotterDialog._set_field_width(spin)
         return spin
 
     @staticmethod
@@ -256,7 +278,43 @@ class TrialPlotterDialog(QDialog):
         spin.setDecimals(2)
         spin.setSingleStep(0.1)
         spin.setValue(value)
+        TrialPlotterDialog._set_field_width(spin)
         return spin
+
+    @staticmethod
+    def _set_field_width(widget):
+        widget.setMinimumWidth(FIELD_WIDTH)
+        widget.setMaximumWidth(FIELD_WIDTH)
+
+    @staticmethod
+    def _add_row(form, label, widget):
+        field = QWidget()
+        layout = QHBoxLayout(field)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+        layout.addWidget(widget)
+        form.addRow(label, field)
+
+    @staticmethod
+    def _form_layout(parent):
+        form = QFormLayout(parent)
+        try:
+            field_growth_policy = QFormLayout.AllNonFixedFieldsGrow
+        except AttributeError:
+            field_growth_policy = QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        form.setFieldGrowthPolicy(field_growth_policy)
+        align_left = TrialPlotterDialog._qt_alignment("AlignLeft")
+        align_top = TrialPlotterDialog._qt_alignment("AlignTop")
+        form.setFormAlignment(align_left | align_top)
+        form.setLabelAlignment(align_left)
+        return form
+
+    @staticmethod
+    def _qt_alignment(name):
+        try:
+            return getattr(Qt, name)
+        except AttributeError:
+            return getattr(Qt.AlignmentFlag, name)
 
     @staticmethod
     def _reference_layer_filter():
