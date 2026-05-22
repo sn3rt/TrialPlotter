@@ -30,6 +30,7 @@ from datetime import datetime
 
 
 CSV_LIMIT_DEFAULT = 150
+AUTO_N_COLS_MAX_STEP_M = 10.0
 AUTO_POLY_LEN_MARGIN_M = 0.25
 AUTO_POLY_LEN_HALF_M = AUTO_POLY_LEN_MARGIN_M / 2.0
 EPS = 1e-9
@@ -79,8 +80,19 @@ def _gap_prefix_sum(gaps: dict, idx_1based: int):
     return s
 
 
+def _auto_plot_count_and_step(p1: QgsPointXY, p2: QgsPointXY):
+    distance = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+    if distance <= EPS:
+        raise QgsProcessingException("Cannot auto-calculate plots: P1 and P2 are identical.")
+
+    n_cols = max(1, math.ceil(distance / AUTO_N_COLS_MAX_STEP_M))
+    step_len = distance / n_cols
+    return n_cols, step_len, distance
+
+
 class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_INPUT = "INPUT_POINTS"
+    P_AUTO_NCOLS = "AUTO_N_COLS"
     P_NCOLS = "N_COLS"
     P_NROWS = "N_ROWS"
     P_STEP_LEN = "STEP_LEN"
@@ -107,6 +119,13 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.P_AUTO_NCOLS,
+                "Auto nr of plots (nr per row, nr of rows and plot distance in sowing direction are ignored)",
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterNumber(
                 self.P_NCOLS,
                 "Plots per sowing line (columns)",
@@ -128,7 +147,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.P_STEP_LEN,
-                "Step between plot origins along sowing direction (m)",
+                "Plot distance in sowing direction (m)",
                 type=QgsProcessingParameterNumber.Double,
                 minValue=0.01,
                 defaultValue=1.0,
@@ -137,7 +156,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.P_STEP_ROW,
-                "Row spacing (perpendicular distance between sowing lines) (m)",
+                "Plot distance across to sowing direction (m)",
                 type=QgsProcessingParameterNumber.Double,
                 minValue=0.01,
                 defaultValue=1.5,
@@ -154,7 +173,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.P_POLY_LEN,
-                "Polygon length along sowing direction (m) (used if auto length is OFF)",
+                "Polygon length in sowing direction (m) (used if auto length is OFF)",
                 type=QgsProcessingParameterNumber.Double,
                 minValue=0.01,
                 defaultValue=1.0,
@@ -173,7 +192,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterString(
                 self.P_GAPS_AFTER_COL,
-                "Optional gap after column(s) per row (e.g. '4:2.0,10:1.0'). Use '-' for none.",
+                "Optional gap after plot(s) in sowing direction (e.g. '4:2.0,10:1.0'). Use '-' for none.",
                 defaultValue="-",
             )
         )
@@ -227,38 +246,15 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             os.makedirs(d)
 
         # ----- Read parameters -----
-        n_cols = self.parameterAsInt(parameters, self.P_NCOLS, context)
+        auto_n_cols = self.parameterAsBool(parameters, self.P_AUTO_NCOLS, context)
+        user_n_cols = self.parameterAsInt(parameters, self.P_NCOLS, context)
         n_rows = self.parameterAsInt(parameters, self.P_NROWS, context)
-        step_len = self.parameterAsDouble(parameters, self.P_STEP_LEN, context)
+        user_step_len = self.parameterAsDouble(parameters, self.P_STEP_LEN, context)
         step_row = self.parameterAsDouble(parameters, self.P_STEP_ROW, context)
 
         auto_poly_len = self.parameterAsBool(parameters, self.P_AUTO_POLY_LEN, context)
         user_poly_len = self.parameterAsDouble(parameters, self.P_POLY_LEN, context)
         poly_wid_user = self.parameterAsDouble(parameters, self.P_POLY_WID, context)
-
-        if auto_poly_len:
-            poly_len = max(0.01, step_len - AUTO_POLY_LEN_MARGIN_M)
-            poly_offset = AUTO_POLY_LEN_HALF_M
-            feedback.pushInfo(
-                f"Auto polygon length ON: POLY_LEN = STEP_LEN - 0.25 = {poly_len:.3f} m; "
-                f"offset = +{poly_offset:.3f} m (12.5cm front/back)"
-            )
-        else:
-            poly_len = user_poly_len
-            poly_offset = 0.0
-            feedback.pushInfo(f"Auto polygon length OFF: using POLY_LEN = {poly_len:.3f} m; offset = 0.000 m")
-
-        if poly_len - step_len > EPS:
-            raise QgsProcessingException("Polygon length must be <= col spacing (STEP_LEN).")
-        if poly_wid_user - step_row > EPS:
-            raise QgsProcessingException("Polygon width must be <= row spacing (STEP_ROW).")
-
-        poly_wid_used = poly_wid_user
-        if abs(poly_wid_user - step_row) < EPS:
-            poly_wid_used = max(0.01, poly_wid_user - 0.01)
-            feedback.pushInfo(
-                f"Polygon width equals row spacing; using {poly_wid_used:.2f} m to keep a small gap between rows."
-            )
 
         col_gaps_raw = self.parameterAsString(parameters, self.P_GAPS_AFTER_COL, context)
         row_gaps_raw = self.parameterAsString(parameters, self.P_GAPS_AFTER_ROW, context)
@@ -301,6 +297,44 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         p1 = to_local.transform(QgsPointXY(p1_src.x(), p1_src.y()))
         p2 = to_local.transform(QgsPointXY(p2_src.x(), p2_src.y()))
         p3 = to_local.transform(QgsPointXY(p3_src.x(), p3_src.y())) if p3_src is not None else None
+
+        p1_p2_distance = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+        if auto_n_cols:
+            n_cols, step_len, p1_p2_distance = _auto_plot_count_and_step(p1, p2)
+            feedback.pushInfo(
+                f"Auto nr of plots ON: P1-P2 distance = {p1_p2_distance:.3f} m; "
+                f"N_COLS = {n_cols}; STEP_LEN = {step_len:.3f} m"
+            )
+        else:
+            n_cols = user_n_cols
+            step_len = user_step_len
+            feedback.pushInfo(
+                f"Auto nr of plots OFF: using N_COLS = {n_cols}; STEP_LEN = {step_len:.3f} m"
+            )
+
+        if auto_poly_len:
+            poly_len = max(0.01, step_len - AUTO_POLY_LEN_MARGIN_M)
+            poly_offset = AUTO_POLY_LEN_HALF_M
+            feedback.pushInfo(
+                f"Auto polygon length ON: POLY_LEN = STEP_LEN - 0.25 = {poly_len:.3f} m; "
+                f"offset = +{poly_offset:.3f} m (12.5cm front/back)"
+            )
+        else:
+            poly_len = user_poly_len
+            poly_offset = 0.0
+            feedback.pushInfo(f"Auto polygon length OFF: using POLY_LEN = {poly_len:.3f} m; offset = 0.000 m")
+
+        if poly_len - step_len > EPS:
+            raise QgsProcessingException("Polygon length must be <= col spacing (STEP_LEN).")
+        if poly_wid_user - step_row > EPS:
+            raise QgsProcessingException("Polygon width must be <= row spacing (STEP_ROW).")
+
+        poly_wid_used = poly_wid_user
+        if abs(poly_wid_user - step_row) < EPS:
+            poly_wid_used = max(0.01, poly_wid_user - 0.01)
+            feedback.pushInfo(
+                f"Polygon width equals row spacing; using {poly_wid_used:.2f} m to keep a small gap between rows."
+            )
 
         # u = sowing direction, v = right-hand perpendicular (polygon width direction)
         ux, uy = _normalize(p2.x() - p1.x(), p2.y() - p1.y())
@@ -515,9 +549,10 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "proj4": aeqd_proj,
             },
             "parameters_entered": {
-                "N_COLS": int(n_cols),
+                "AUTO_N_COLS": bool(auto_n_cols),
+                "N_COLS": int(user_n_cols),
                 "N_ROWS": int(n_rows),
-                "STEP_LEN": float(step_len),
+                "STEP_LEN": float(user_step_len),
                 "STEP_ROW": float(step_row),
                 "AUTO_POLY_LEN": bool(auto_poly_len),
                 "POLY_LEN_USER": float(user_poly_len),
@@ -528,6 +563,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "LIMIT_CSV": bool(limit_csv),
             },
             "parameters_used": {
+                "N_COLS_USED": int(n_cols),
+                "STEP_LEN_USED": float(step_len),
+                "P1_P2_DISTANCE_M": float(p1_p2_distance),
                 "POLY_LEN_USED": float(poly_len),
                 "POLY_OFFSET_USED": float(poly_offset),
                 "POLY_WID_USED": float(poly_wid_used),
@@ -559,6 +597,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             "CSV_FOLDER": csv_dir,
             "CSV_FILES": n_files,
             "CSV_LIMIT": (CSV_LIMIT_DEFAULT if limit_csv else "disabled"),
+            "N_COLS_USED": n_cols,
+            "STEP_LEN_USED": step_len,
             "POLY_LEN_USED": poly_len,
             "POLY_OFFSET_USED": poly_offset,
         }

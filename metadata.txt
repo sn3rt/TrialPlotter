@@ -1,7 +1,7 @@
 [general]
 name=TrialPlotter
 qgisMinimumVersion=3.10
-qgisMaximumVersion=3.99
+qgisMaximumVersion=4.99
 description=Generate trial plot polygons and CSV from 2 or 3 RTK points.
 about=Creates a plot layout (rectangular polygons) plus CSV corner coordinates for field apps. Supports zigzag driving and optional headland row shift using a 3rd point.
 version=0.1.0

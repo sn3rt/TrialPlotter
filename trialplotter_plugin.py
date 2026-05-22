@@ -16,6 +16,7 @@ class TrialPlotterPlugin:
         self.iface = iface
         self.action = None
         self.provider = None
+        self.provider_id = "wur_trialplotter"
 
     def initGui(self):
         current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -39,8 +40,30 @@ class TrialPlotterPlugin:
             self.action = None
 
         if self.provider:
-            QgsApplication.processingRegistry().removeProvider(self.provider)
+            self._remove_processing_provider()
             self.provider = None
+
+    def _remove_processing_provider(self):
+        registry = QgsApplication.processingRegistry()
+
+        try:
+            registry.removeProvider(self.provider_id)
+        except TypeError:
+            # Older QGIS versions only accept the provider object.
+            try:
+                registry.removeProvider(self.provider)
+            except RuntimeError as e:
+                QgsMessageLog.logMessage(
+                    f"Processing provider was already removed: {e}",
+                    "TrialPlotter",
+                    Qgis.Info,
+                )
+        except RuntimeError as e:
+            QgsMessageLog.logMessage(
+                f"Processing provider was already removed: {e}",
+                "TrialPlotter",
+                Qgis.Info,
+            )
 
     def run(self):
         try:
