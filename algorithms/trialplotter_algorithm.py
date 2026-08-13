@@ -35,6 +35,8 @@ CSV_LIMIT_DEFAULT = 150
 AUTO_N_COLS_MAX_STEP_M = 10.0
 AUTO_POLY_LEN_MARGIN_M = 0.25
 AUTO_POLY_LEN_HALF_M = AUTO_POLY_LEN_MARGIN_M / 2.0
+TRAITSEEKER_CSV_WIDTH_MARGIN_M = 0.01
+TRAITSEEKER_CSV_WIDTH_HALF_MARGIN_M = TRAITSEEKER_CSV_WIDTH_MARGIN_M / 2.0
 EPS = 1e-9
 
 
@@ -128,6 +130,7 @@ def _single_line_from_feature(feat):
 
 class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_INPUT = "INPUT_POINTS"
+    P_USE_SELECTED_LINE = "USE_SELECTED_LINE_FEATURE"
     P_REVERSE_LINE = "REVERSE_LINE_DIRECTION"
     P_START_OFFSET = "START_OFFSET_M"
     P_SIDE_OFFSET = "SIDE_OFFSET_M"
@@ -137,6 +140,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_NROWS = "N_ROWS"
     P_STEP_LEN = "STEP_LEN"
     P_STEP_ROW = "STEP_ROW"
+    P_TRAITSEEKER = "TRAITSEEKER_OUTPUT"
     P_AUTO_POLY_LEN = "AUTO_POLY_LEN"
     P_POLY_LEN = "POLY_LEN"
     P_POLY_WID = "POLY_WID"
@@ -153,8 +157,16 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.P_INPUT,
-                "Reference layer (points: P1=lower-left, P2=sowing direction, optional P3=headland direction; or one line)",
+                "Reference layer (points: P1=lower-left, P2=sowing direction, optional P3=headland direction; or a line)",
                 types=[QgsProcessing.TypeVectorPoint, QgsProcessing.TypeVectorLine],
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.P_USE_SELECTED_LINE,
+                "Use selected feature (line layers only; requires exactly one selected line)",
+                defaultValue=False,
             )
         )
 
@@ -237,10 +249,17 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
         self.addParameter(
             QgsProcessingParameterBoolean(
+                self.P_TRAITSEEKER,
+                "TraitSeeker output (CSV width 1 cm narrower; affects auto polygon length)",
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
                 self.P_AUTO_POLY_LEN,
-                "Auto polygon length "
-                f"(creates {AUTO_POLY_LEN_MARGIN_M * 100:g} cm space between plots "
-                f"({AUTO_POLY_LEN_HALF_M * 100:g} cm front/back))",
+                "Auto polygon length (full plot distance normally; TraitSeeker removes "
+                f"{AUTO_POLY_LEN_MARGIN_M * 100:g} cm, "
+                f"{AUTO_POLY_LEN_HALF_M * 100:g} cm front/back)",
                 defaultValue=True,
             )
         )
@@ -323,6 +342,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         auto_n_cols = self.parameterAsBool(parameters, self.P_AUTO_NCOLS, context)
         user_n_cols = self.parameterAsInt(parameters, self.P_NCOLS, context)
         n_rows = self.parameterAsInt(parameters, self.P_NROWS, context)
+        use_selected_line = self.parameterAsBool(parameters, self.P_USE_SELECTED_LINE, context)
         reverse_line = self.parameterAsBool(parameters, self.P_REVERSE_LINE, context)
         start_offset = self.parameterAsDouble(parameters, self.P_START_OFFSET, context)
         side_offset = self.parameterAsDouble(parameters, self.P_SIDE_OFFSET, context)
@@ -330,6 +350,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         user_step_len = self.parameterAsDouble(parameters, self.P_STEP_LEN, context)
         step_row = self.parameterAsDouble(parameters, self.P_STEP_ROW, context)
 
+        traitseeker_output = self.parameterAsBool(parameters, self.P_TRAITSEEKER, context)
         auto_poly_len = self.parameterAsBool(parameters, self.P_AUTO_POLY_LEN, context)
         user_poly_len = self.parameterAsDouble(parameters, self.P_POLY_LEN, context)
         poly_wid_user = self.parameterAsDouble(parameters, self.P_POLY_WID, context)
@@ -351,6 +372,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
         if _is_point_layer(layer):
             reference_mode = "point"
+            if use_selected_line:
+                feedback.pushInfo("Use selected feature is ignored for point reference layers.")
             if len(feats) not in (2, 3):
                 raise QgsProcessingException("Point reference layer must contain exactly 2 or 3 points (P1, P2, optional P3).")
 
@@ -364,10 +387,27 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             crs_origin_src = QgsPointXY(p1_src.x(), p1_src.y())
         elif _is_line_layer(layer):
             reference_mode = "line"
-            if len(feats) != 1:
-                raise QgsProcessingException("Line reference layer must contain exactly 1 line feature.")
+            if use_selected_line:
+                selected_feats = sorted(layer.selectedFeatures(), key=lambda f: f.id())
+                if len(selected_feats) != 1:
+                    raise QgsProcessingException(
+                        "Use selected feature requires exactly 1 selected line feature; "
+                        f"found {len(selected_feats)}."
+                    )
+                reference_feat = selected_feats[0]
+                feedback.pushInfo(
+                    f"Using selected line feature ID {reference_feat.id()} "
+                    f"from a layer containing {len(feats)} features."
+                )
+            else:
+                if len(feats) != 1:
+                    raise QgsProcessingException(
+                        "Line reference layer must contain exactly 1 line feature, or enable "
+                        "Use selected feature and select exactly one line in QGIS."
+                    )
+                reference_feat = feats[0]
 
-            line = _single_line_from_feature(feats[0])
+            line = _single_line_from_feature(reference_feat)
             line_start_src = QgsPointXY(line[0])
             line_end_src = QgsPointXY(line[-1])
             if reverse_line:
@@ -471,6 +511,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "layer_source": layer.source(),
                 "crs": src_crs.authid(),
                 "num_features": len(feats),
+                "use_selected_feature": bool(use_selected_line),
+                "reference_feature_id": int(reference_feat.id()),
                 "num_vertices": len(line),
                 "reverse_reference": bool(reverse_line),
                 "start_offset_m": float(start_offset),
@@ -494,12 +536,23 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 f"Auto nr of plots OFF: using N_COLS = {n_cols}; STEP_LEN = {step_len:.3f} m"
             )
 
-        if auto_poly_len:
-            poly_len = max(0.01, step_len - AUTO_POLY_LEN_MARGIN_M)
+        if auto_poly_len and traitseeker_output:
+            poly_len = step_len - AUTO_POLY_LEN_MARGIN_M
+            if poly_len < 0.01 - EPS:
+                raise QgsProcessingException(
+                    "TraitSeeker auto polygon length requires a plot distance of at least 0.26 m."
+                )
             poly_offset = AUTO_POLY_LEN_HALF_M
             feedback.pushInfo(
-                f"Auto polygon length ON: POLY_LEN = STEP_LEN - 0.25 = {poly_len:.3f} m; "
-                f"offset = +{poly_offset:.3f} m (12.5cm front/back)"
+                f"Auto polygon length ON with TraitSeeker: POLY_LEN = STEP_LEN - "
+                f"{AUTO_POLY_LEN_MARGIN_M:.2f} = {poly_len:.3f} m; offset = "
+                f"+{poly_offset:.3f} m ({AUTO_POLY_LEN_HALF_M * 100:g} cm front/back)"
+            )
+        elif auto_poly_len:
+            poly_len = step_len
+            poly_offset = 0.0
+            feedback.pushInfo(
+                f"Auto polygon length ON without TraitSeeker: using full STEP_LEN = {poly_len:.3f} m"
             )
         else:
             poly_len = user_poly_len
@@ -512,14 +565,32 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException("Polygon width must be <= row spacing (STEP_ROW).")
 
         poly_wid_used = poly_wid_user
-        if abs(poly_wid_user - step_row) < EPS:
-            poly_wid_used = max(0.01, poly_wid_user - 0.01)
+        if traitseeker_output:
+            if poly_wid_used <= TRAITSEEKER_CSV_WIDTH_MARGIN_M + EPS:
+                raise QgsProcessingException(
+                    "TraitSeeker output requires a polygon width greater than 0.01 m."
+                )
+            csv_poly_wid_used = poly_wid_used - TRAITSEEKER_CSV_WIDTH_MARGIN_M
+            csv_side_offset = TRAITSEEKER_CSV_WIDTH_HALF_MARGIN_M
             feedback.pushInfo(
-                f"Polygon width equals row spacing; using {poly_wid_used:.2f} m to keep a small gap between rows."
+                f"TraitSeeker CSV width = {csv_poly_wid_used:.3f} m; CSV sides are inset "
+                f"{TRAITSEEKER_CSV_WIDTH_HALF_MARGIN_M * 100:g} cm from the polygon sides."
             )
+        else:
+            csv_poly_wid_used = poly_wid_used
+            csv_side_offset = 0.0
+            feedback.pushInfo("TraitSeeker output OFF: polygon and CSV widths are identical.")
 
+        feedback.pushInfo(
+            f"Polygon dimensions used: length={poly_len:.3f} m, width={poly_wid_used:.3f} m"
+        )
+        feedback.pushInfo(
+            f"CSV footprint dimensions used: length={poly_len:.3f} m, "
+            f"width={csv_poly_wid_used:.3f} m"
+        )
         feedback.pushInfo(f"Output folder: {out_root}")
         feedback.pushInfo(f"Reference mode: {reference_mode}")
+        feedback.pushInfo(f"TraitSeeker output: {'yes' if traitseeker_output else 'no'}")
         feedback.pushInfo(f"Local CRS: AEQD centered on reference origin (lat={lat0:.8f}, lon={lon0:.8f})")
         if reference_mode == "line":
             feedback.pushInfo(f"Reference reversed: {'yes' if reverse_line else 'no'}")
@@ -565,11 +636,28 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 B = QgsPointXY(ox + ux * poly_len, oy + uy * poly_len)
                 C = QgsPointXY(B.x() + row_dir_x * poly_wid_used, B.y() + row_dir_y * poly_wid_used)
                 D = QgsPointXY(ox + row_dir_x * poly_wid_used, oy + row_dir_y * poly_wid_used)
-                cells[c] = (A, B, C, D)
+
+                csv_A = QgsPointXY(
+                    A.x() + row_dir_x * csv_side_offset,
+                    A.y() + row_dir_y * csv_side_offset,
+                )
+                csv_B = QgsPointXY(
+                    B.x() + row_dir_x * csv_side_offset,
+                    B.y() + row_dir_y * csv_side_offset,
+                )
+                csv_C = QgsPointXY(
+                    csv_B.x() + row_dir_x * csv_poly_wid_used,
+                    csv_B.y() + row_dir_y * csv_poly_wid_used,
+                )
+                csv_D = QgsPointXY(
+                    csv_A.x() + row_dir_x * csv_poly_wid_used,
+                    csv_A.y() + row_dir_y * csv_poly_wid_used,
+                )
+                cells[c] = (A, B, C, D, csv_A, csv_B, csv_C, csv_D)
 
             # numbering ALWAYS forward (no zigzag numbering)
             for c in base_cols:
-                A, B, C, D = cells[c]
+                A, B, C, D, csv_A, csv_B, csv_C, csv_D = cells[c]
                 plot_id += 1
 
                 ring_local = [A, B, C, D, A]
@@ -585,10 +673,10 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 pr.addFeature(feat_out)
 
                 # WGS84 for CSV
-                Awgs = from_local_to_wgs.transform(A)
-                Bwgs = from_local_to_wgs.transform(B)
-                Cwgs = from_local_to_wgs.transform(C)
-                Dwgs = from_local_to_wgs.transform(D)
+                Awgs = from_local_to_wgs.transform(csv_A)
+                Bwgs = from_local_to_wgs.transform(csv_B)
+                Cwgs = from_local_to_wgs.transform(csv_C)
+                Dwgs = from_local_to_wgs.transform(csv_D)
 
                 Apt = QgsPointXY(Awgs.x(), Awgs.y())
                 Bpt = QgsPointXY(Bwgs.x(), Bwgs.y())
@@ -705,12 +793,14 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "AUTO_N_COLS": bool(auto_n_cols),
                 "N_COLS": int(user_n_cols),
                 "N_ROWS": int(n_rows),
+                "USE_SELECTED_LINE_FEATURE": bool(use_selected_line),
                 "REVERSE_REFERENCE": bool(reverse_line),
                 "START_OFFSET_M": float(start_offset),
                 "SIDE_OFFSET_M": float(side_offset),
                 "FLIP_PLOT_SIDE": bool(flip_plot_side),
                 "STEP_LEN": float(user_step_len),
                 "STEP_ROW": float(step_row),
+                "TRAITSEEKER_OUTPUT": bool(traitseeker_output),
                 "AUTO_POLY_LEN": bool(auto_poly_len),
                 "POLY_LEN_USER": float(user_poly_len),
                 "POLY_WID_USER": float(poly_wid_user),
@@ -727,6 +817,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "POLY_LEN_USED": float(poly_len),
                 "POLY_OFFSET_USED": float(poly_offset),
                 "POLY_WID_USED": float(poly_wid_used),
+                "CSV_POLY_LEN_USED": float(poly_len),
+                "CSV_POLY_WID_USED": float(csv_poly_wid_used),
+                "CSV_SIDE_OFFSET_USED": float(csv_side_offset),
                 "CSV_LIMIT": int(CSV_LIMIT_DEFAULT) if limit_csv else None,
             },
             "direction_vectors_local": {
@@ -760,6 +853,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             "STEP_LEN_USED": step_len,
             "POLY_LEN_USED": poly_len,
             "POLY_OFFSET_USED": poly_offset,
+            "POLY_WID_USED": poly_wid_used,
+            "CSV_POLY_WID_USED": csv_poly_wid_used,
+            "TRAITSEEKER_OUTPUT": traitseeker_output,
         }
 
     

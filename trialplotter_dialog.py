@@ -26,6 +26,8 @@ from .algorithms.trialplotter_algorithm import (
     AUTO_N_COLS_MAX_STEP_M,
     AUTO_POLY_LEN_HALF_M,
     AUTO_POLY_LEN_MARGIN_M,
+    TRAITSEEKER_CSV_WIDTH_HALF_MARGIN_M,
+    TRAITSEEKER_CSV_WIDTH_MARGIN_M,
     TrialPlotterAlgorithm,
 )
 
@@ -95,6 +97,11 @@ class TrialPlotterDialog(QDialog):
         self.line_group = QGroupBox("Reference")
         form = self._form_layout(self.line_group)
 
+        self.use_selected_line = QCheckBox("(requires exactly one selected line)")
+        self.use_selected_line.setChecked(False)
+        self._set_field_width(self.use_selected_line)
+        self._add_row(form, "Use selected feature", self.use_selected_line)
+
         self.reverse_line = QCheckBox("")
         self.reverse_line.setChecked(False)
         self._set_field_width(self.reverse_line)
@@ -142,10 +149,15 @@ class TrialPlotterDialog(QDialog):
         group = QGroupBox("Polygon Size")
         form = self._form_layout(group)
 
-        self.auto_poly_len = QCheckBox(
-            f"(cuts {_centimeters_label(AUTO_POLY_LEN_MARGIN_M)} of plots, "
-            f"front & back {_centimeters_label(AUTO_POLY_LEN_HALF_M)})"
+        self.traitseeker_output = QCheckBox(
+            f"(CSV {_centimeters_label(TRAITSEEKER_CSV_WIDTH_MARGIN_M)} narrower: "
+            f"{_centimeters_label(TRAITSEEKER_CSV_WIDTH_HALF_MARGIN_M)} per row side)"
         )
+        self.traitseeker_output.setChecked(False)
+        self._set_field_width(self.traitseeker_output)
+        self._add_row(form, "TraitSeeker output", self.traitseeker_output)
+
+        self.auto_poly_len = QCheckBox("")
         self.auto_poly_len.setChecked(True)
         self._set_field_width(self.auto_poly_len)
         self._add_row(form, "Auto polygon length", self.auto_poly_len)
@@ -188,6 +200,7 @@ class TrialPlotterDialog(QDialog):
         self.input_layer.layerChanged.connect(self._sync_enabled_fields)
         self.auto_n_cols.toggled.connect(self._sync_enabled_fields)
         self.auto_poly_len.toggled.connect(self._sync_enabled_fields)
+        self.traitseeker_output.toggled.connect(self._sync_enabled_fields)
         self.button_box.accepted.connect(self._run_algorithm)
         self.button_box.rejected.connect(self.reject)
 
@@ -201,17 +214,29 @@ class TrialPlotterDialog(QDialog):
 
     def _sync_enabled_fields(self, *args):
         layer = self.input_layer.currentLayer()
-        reference_mode = bool(layer and hasattr(layer, "geometryType") and (
-            layer.geometryType() == self._point_geometry_type()
-            or layer.geometryType() == self._line_geometry_type()
-        ))
+        geometry_type = layer.geometryType() if layer and hasattr(layer, "geometryType") else None
+        reference_mode = geometry_type in (
+            self._point_geometry_type(),
+            self._line_geometry_type(),
+        )
+        line_mode = geometry_type == self._line_geometry_type()
         self.line_group.setVisible(reference_mode)
+        self.use_selected_line.setEnabled(line_mode)
+        if not line_mode:
+            self.use_selected_line.setChecked(False)
 
         manual_grid = not self.auto_n_cols.isChecked()
         self.n_cols.setEnabled(manual_grid)
         self.step_len.setEnabled(manual_grid)
         self.gaps_after_col.setEnabled(manual_grid)
         self.poly_len.setEnabled(not self.auto_poly_len.isChecked())
+        if self.traitseeker_output.isChecked():
+            self.auto_poly_len.setText(
+                f"(cuts {_centimeters_label(AUTO_POLY_LEN_MARGIN_M)}: "
+                f"{_centimeters_label(AUTO_POLY_LEN_HALF_M)} front/back)"
+            )
+        else:
+            self.auto_poly_len.setText("(uses full plot distance)")
 
     def _parameters(self):
         layer = self.input_layer.currentLayer()
@@ -220,6 +245,7 @@ class TrialPlotterDialog(QDialog):
 
         return {
             TrialPlotterAlgorithm.P_INPUT: layer,
+            TrialPlotterAlgorithm.P_USE_SELECTED_LINE: self.use_selected_line.isChecked(),
             TrialPlotterAlgorithm.P_REVERSE_LINE: self.reverse_line.isChecked(),
             TrialPlotterAlgorithm.P_START_OFFSET: self.start_offset.value(),
             TrialPlotterAlgorithm.P_SIDE_OFFSET: self.side_offset.value(),
@@ -229,6 +255,7 @@ class TrialPlotterDialog(QDialog):
             TrialPlotterAlgorithm.P_NROWS: self.n_rows.value(),
             TrialPlotterAlgorithm.P_STEP_LEN: self.step_len.value(),
             TrialPlotterAlgorithm.P_STEP_ROW: self.step_row.value(),
+            TrialPlotterAlgorithm.P_TRAITSEEKER: self.traitseeker_output.isChecked(),
             TrialPlotterAlgorithm.P_AUTO_POLY_LEN: self.auto_poly_len.isChecked(),
             TrialPlotterAlgorithm.P_POLY_LEN: self.poly_len.value(),
             TrialPlotterAlgorithm.P_POLY_WID: self.poly_wid.value(),
