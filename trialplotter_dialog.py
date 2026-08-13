@@ -2,6 +2,7 @@
 import processing
 
 from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,13 +15,23 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import Qgis, QgsMapLayerProxyModel, QgsMessageLog, QgsWkbTypes
-from qgis.gui import QgsMapLayerComboBox
+from qgis.core import (
+    Qgis,
+    QgsExpression,
+    QgsExpressionContext,
+    QgsExpressionContextUtils,
+    QgsFeature,
+    QgsMapLayerProxyModel,
+    QgsMessageLog,
+    QgsWkbTypes,
+)
+from qgis.gui import QgsHighlight, QgsMapLayerComboBox, QgsMapToolIdentifyFeature
 
 from .algorithms.trialplotter_algorithm import (
     AUTO_N_COLS_MAX_STEP_M,
@@ -47,7 +58,14 @@ class TrialPlotterDialog(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent or iface.mainWindow())
         self.iface = iface
+        self._reference_line_fid = None
+        self._reference_line_text = ""
+        self._line_highlight = None
+        self._identify_tool = None
+        self._previous_map_tool = None
+        self._picking_active = False
 
+        self.setModal(False)
         self.setWindowTitle("TrialPlotter")
         self.setMinimumWidth(580)
         self.resize(680, 720)
@@ -55,7 +73,7 @@ class TrialPlotterDialog(QDialog):
         self._build_ui()
         self._connect_signals()
         self._set_initial_layer()
-        self._sync_enabled_fields()
+        self._input_layer_changed()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -97,10 +115,20 @@ class TrialPlotterDialog(QDialog):
         self.line_group = QGroupBox("Reference")
         form = self._form_layout(self.line_group)
 
-        self.use_selected_line = QCheckBox("(requires exactly one selected line)")
-        self.use_selected_line.setChecked(False)
-        self._set_field_width(self.use_selected_line)
-        self._add_row(form, "Use selected feature", self.use_selected_line)
+        self.reference_line_label = QLabel("Reference line")
+        self.reference_line_field = QWidget()
+        picker_layout = QHBoxLayout(self.reference_line_field)
+        picker_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.reference_line_value = QLineEdit()
+        self.reference_line_value.setReadOnly(True)
+        self.reference_line_value.setPlaceholderText("No line chosen")
+        picker_layout.addWidget(self.reference_line_value, 1)
+
+        self.pick_line_button = QPushButton("Pick line on map")
+        picker_layout.addWidget(self.pick_line_button)
+        self._set_field_width(self.reference_line_field)
+        form.addRow(self.reference_line_label, self.reference_line_field)
 
         self.reverse_line = QCheckBox("")
         self.reverse_line.setChecked(False)
@@ -197,12 +225,14 @@ class TrialPlotterDialog(QDialog):
         return group
 
     def _connect_signals(self):
-        self.input_layer.layerChanged.connect(self._sync_enabled_fields)
+        self.input_layer.layerChanged.connect(self._input_layer_changed)
+        self.pick_line_button.clicked.connect(self._toggle_line_picking)
         self.auto_n_cols.toggled.connect(self._sync_enabled_fields)
         self.auto_poly_len.toggled.connect(self._sync_enabled_fields)
         self.traitseeker_output.toggled.connect(self._sync_enabled_fields)
         self.button_box.accepted.connect(self._run_algorithm)
         self.button_box.rejected.connect(self.reject)
+        self.finished.connect(self._dialog_finished)
 
     def _set_initial_layer(self):
         layer = self.iface.activeLayer()
@@ -221,9 +251,11 @@ class TrialPlotterDialog(QDialog):
         )
         line_mode = geometry_type == self._line_geometry_type()
         self.line_group.setVisible(reference_mode)
-        self.use_selected_line.setEnabled(line_mode)
-        if not line_mode:
-            self.use_selected_line.setChecked(False)
+        self.reference_line_label.setVisible(line_mode)
+        self.reference_line_field.setVisible(line_mode)
+        self.pick_line_button.setEnabled(
+            line_mode and (self._picking_active or layer.featureCount() > 0)
+        )
 
         manual_grid = not self.auto_n_cols.isChecked()
         self.n_cols.setEnabled(manual_grid)
@@ -238,14 +270,217 @@ class TrialPlotterDialog(QDialog):
         else:
             self.auto_poly_len.setText("(uses full plot distance)")
 
+    def _input_layer_changed(self, *args):
+        self._cancel_line_picking()
+        self._clear_line_highlight()
+        self._reference_line_fid = None
+        self._reference_line_text = ""
+        self._sync_enabled_fields()
+
+        layer = self.input_layer.currentLayer()
+        if not self._is_line_layer(layer):
+            self._update_reference_line_display()
+            return
+
+        selected_features = sorted(layer.selectedFeatures(), key=lambda feature: feature.id())
+        if len(selected_features) == 1:
+            self._set_reference_line_feature(selected_features[0])
+            return
+
+        if layer.featureCount() == 1:
+            feature = next(layer.getFeatures(), None)
+            if feature is not None:
+                self._set_reference_line_feature(feature)
+                return
+
+        self._update_reference_line_display()
+
+    def _toggle_line_picking(self):
+        if self._picking_active:
+            self._cancel_line_picking()
+            return
+
+        layer = self.input_layer.currentLayer()
+        if not self._is_line_layer(layer):
+            QMessageBox.warning(self, "TrialPlotter", "Select a line reference layer first.")
+            return
+        if layer.featureCount() == 0:
+            QMessageBox.warning(self, "TrialPlotter", "The reference line layer is empty.")
+            return
+
+        canvas = self.iface.mapCanvas()
+        self._previous_map_tool = canvas.mapTool()
+        self._identify_tool = QgsMapToolIdentifyFeature(canvas, layer)
+        self._identify_tool.featureIdentified.connect(self._line_feature_picked)
+        self._identify_tool.deactivated.connect(self._line_picker_deactivated)
+        self._picking_active = True
+        self.pick_line_button.setText("Cancel picking")
+        self.button_box.button(self._ok_button()).setEnabled(False)
+        canvas.setMapTool(self._identify_tool)
+
+        try:
+            self.iface.messageBar().pushMessage(
+                "TrialPlotter",
+                "Click the reference line on the map.",
+                level=Qgis.Info,
+                duration=4,
+            )
+        except (AttributeError, TypeError):
+            pass
+
+    def _line_feature_picked(self, feature):
+        layer = self.input_layer.currentLayer()
+        if not self._is_line_layer(layer):
+            return
+
+        if not isinstance(feature, QgsFeature):
+            feature = layer.getFeature(int(feature))
+        if not feature.isValid():
+            QMessageBox.warning(
+                self,
+                "TrialPlotter",
+                "The clicked line could not be read. Try selecting it again.",
+            )
+            return
+
+        self._set_reference_line_feature(feature)
+        self._cancel_line_picking()
+
+    def _line_picker_deactivated(self):
+        if not self._picking_active:
+            return
+
+        tool = self._identify_tool
+        self._picking_active = False
+        self._identify_tool = None
+        self._previous_map_tool = None
+        self._reset_picker_controls()
+        if tool is not None:
+            tool.deleteLater()
+
+    def _cancel_line_picking(self, restore_previous=True):
+        tool = self._identify_tool
+        previous_tool = self._previous_map_tool
+        self._picking_active = False
+        self._identify_tool = None
+        self._previous_map_tool = None
+
+        if tool is not None:
+            try:
+                tool.featureIdentified.disconnect(self._line_feature_picked)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                tool.deactivated.disconnect(self._line_picker_deactivated)
+            except (RuntimeError, TypeError):
+                pass
+
+            canvas = self.iface.mapCanvas()
+            if restore_previous and canvas.mapTool() is tool:
+                try:
+                    if previous_tool is not None:
+                        canvas.setMapTool(previous_tool)
+                    else:
+                        canvas.unsetMapTool(tool)
+                except RuntimeError:
+                    canvas.unsetMapTool(tool)
+            tool.deleteLater()
+
+        self._reset_picker_controls()
+
+    def _reset_picker_controls(self):
+        self.pick_line_button.setText("Pick line on map")
+        self.button_box.button(self._ok_button()).setEnabled(True)
+        self._sync_enabled_fields()
+
+    def _set_reference_line_feature(self, feature):
+        layer = self.input_layer.currentLayer()
+        if not self._is_line_layer(layer) or not feature.isValid():
+            return
+
+        self._reference_line_fid = int(feature.id())
+        self._reference_line_text = self._feature_display_text(layer, feature)
+        self._update_reference_line_display()
+        self._show_line_highlight(layer, feature)
+
+    def _update_reference_line_display(self):
+        if self._reference_line_fid is None:
+            self.reference_line_value.clear()
+            self.reference_line_value.setPlaceholderText("No line chosen — click Pick line on map")
+        else:
+            self.reference_line_value.setText(self._reference_line_text)
+
+    def _show_line_highlight(self, layer, feature):
+        self._clear_line_highlight()
+        geometry = feature.geometry()
+        if not geometry or geometry.isEmpty():
+            return
+
+        highlight = QgsHighlight(self.iface.mapCanvas(), feature, layer)
+        color = QColor(255, 140, 0)
+        highlight.setColor(color)
+        fill_color = QColor(color)
+        fill_color.setAlpha(50)
+        highlight.setFillColor(fill_color)
+        highlight.setWidth(3)
+        highlight.show()
+        self._line_highlight = highlight
+
+    def _clear_line_highlight(self):
+        if self._line_highlight is not None:
+            self._line_highlight.hide()
+            self._line_highlight = None
+
+    @staticmethod
+    def _feature_display_text(layer, feature):
+        display_text = ""
+        expression_text = (layer.displayExpression() or "").strip()
+        if expression_text:
+            expression = QgsExpression(expression_text)
+            if not expression.hasParserError():
+                context = QgsExpressionContext()
+                context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(layer))
+                context.setFeature(feature)
+                value = expression.evaluate(context)
+                if not expression.hasEvalError() and value is not None:
+                    display_text = str(value).strip()
+                    if display_text.upper() == "NULL":
+                        display_text = ""
+
+        label = display_text or "Feature"
+        return f"{label} (ID: {feature.id()})"
+
+    def cleanup(self):
+        self._cancel_line_picking()
+        self._clear_line_highlight()
+
+    def _dialog_finished(self, *args):
+        self.cleanup()
+
     def _parameters(self):
         layer = self.input_layer.currentLayer()
         if layer is None:
             raise ValueError("Select a reference layer.")
 
+        self._cancel_line_picking()
+
+        line_feature_id = "-"
+        if layer.geometryType() == self._line_geometry_type():
+            if self._reference_line_fid is not None:
+                feature = layer.getFeature(self._reference_line_fid)
+                if not feature.isValid():
+                    raise ValueError(
+                        f"Reference line feature ID {self._reference_line_fid} no longer exists. "
+                        "Pick a line again."
+                    )
+                line_feature_id = str(self._reference_line_fid)
+            elif layer.featureCount() != 1:
+                raise ValueError("Pick one reference line on the map.")
+
         return {
             TrialPlotterAlgorithm.P_INPUT: layer,
-            TrialPlotterAlgorithm.P_USE_SELECTED_LINE: self.use_selected_line.isChecked(),
+            TrialPlotterAlgorithm.P_LINE_FEATURE_ID: line_feature_id,
+            TrialPlotterAlgorithm.P_USE_SELECTED_LINE: False,
             TrialPlotterAlgorithm.P_REVERSE_LINE: self.reverse_line.isChecked(),
             TrialPlotterAlgorithm.P_START_OFFSET: self.start_offset.value(),
             TrialPlotterAlgorithm.P_SIDE_OFFSET: self.side_offset.value(),
@@ -349,6 +584,14 @@ class TrialPlotterDialog(QDialog):
             return QgsMapLayerProxyModel.PointLayer | QgsMapLayerProxyModel.LineLayer
         except AttributeError:
             return QgsMapLayerProxyModel.Filter.PointLayer | QgsMapLayerProxyModel.Filter.LineLayer
+
+    @classmethod
+    def _is_line_layer(cls, layer):
+        return bool(
+            layer
+            and hasattr(layer, "geometryType")
+            and layer.geometryType() == cls._line_geometry_type()
+        )
 
     @staticmethod
     def _point_geometry_type():

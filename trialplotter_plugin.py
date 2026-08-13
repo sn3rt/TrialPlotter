@@ -14,6 +14,7 @@ class TrialPlotterPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.action = None
+        self.dialog = None
         self.provider = None
         self.provider_id = "wur_trialplotter"
 
@@ -33,6 +34,13 @@ class TrialPlotterPlugin:
         QgsApplication.processingRegistry().addProvider(self.provider)
 
     def unload(self):
+        if self.dialog is not None:
+            dialog = self.dialog
+            self.dialog = None
+            dialog.cleanup()
+            dialog.close()
+            dialog.deleteLater()
+
         if self.action:
             self.iface.removeToolBarIcon(self.action)
             self.iface.removePluginVectorMenu("TrialPlotter", self.action)
@@ -64,13 +72,22 @@ class TrialPlotterPlugin:
                 Qgis.Info,
             )
 
+    def _dialog_finished(self, *args):
+        dialog = self.dialog
+        self.dialog = None
+        if dialog is not None:
+            dialog.cleanup()
+            dialog.deleteLater()
+
     def run(self):
         try:
-            dialog = TrialPlotterDialog(self.iface, self.iface.mainWindow())
-            if hasattr(dialog, "exec"):
-                dialog.exec()
-            else:
-                dialog.exec_()
+            if self.dialog is None:
+                self.dialog = TrialPlotterDialog(self.iface, self.iface.mainWindow())
+                self.dialog.finished.connect(self._dialog_finished)
+
+            self.dialog.show()
+            self.dialog.raise_()
+            self.dialog.activateWindow()
         except Exception as e:
             QgsMessageLog.logMessage(str(e), "TrialPlotter", Qgis.Critical)
             QMessageBox.critical(

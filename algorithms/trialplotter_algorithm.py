@@ -128,8 +128,22 @@ def _single_line_from_feature(feat):
     return line
 
 
+def _parse_optional_feature_id(value):
+    value = str(value or "").strip()
+    if not value or value.lower() in ("-", "none", "null"):
+        return None
+
+    try:
+        return int(value)
+    except ValueError as e:
+        raise QgsProcessingException(
+            f"Invalid reference line feature ID '{value}'. Use an integer feature ID."
+        ) from e
+
+
 class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
     P_INPUT = "INPUT_POINTS"
+    P_LINE_FEATURE_ID = "REFERENCE_LINE_FEATURE_ID"
     P_USE_SELECTED_LINE = "USE_SELECTED_LINE_FEATURE"
     P_REVERSE_LINE = "REVERSE_LINE_DIRECTION"
     P_START_OFFSET = "START_OFFSET_M"
@@ -159,6 +173,14 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 self.P_INPUT,
                 "Reference layer (points: P1=lower-left, P2=sowing direction, optional P3=headland direction; or a line)",
                 types=[QgsProcessing.TypeVectorPoint, QgsProcessing.TypeVectorLine],
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.P_LINE_FEATURE_ID,
+                "Reference line feature ID (optional; takes priority over selected feature)",
+                defaultValue="-",
             )
         )
 
@@ -342,6 +364,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
         auto_n_cols = self.parameterAsBool(parameters, self.P_AUTO_NCOLS, context)
         user_n_cols = self.parameterAsInt(parameters, self.P_NCOLS, context)
         n_rows = self.parameterAsInt(parameters, self.P_NROWS, context)
+        line_feature_id_raw = self.parameterAsString(parameters, self.P_LINE_FEATURE_ID, context)
+        line_feature_id = _parse_optional_feature_id(line_feature_id_raw)
         use_selected_line = self.parameterAsBool(parameters, self.P_USE_SELECTED_LINE, context)
         reverse_line = self.parameterAsBool(parameters, self.P_REVERSE_LINE, context)
         start_offset = self.parameterAsDouble(parameters, self.P_START_OFFSET, context)
@@ -372,8 +396,8 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
 
         if _is_point_layer(layer):
             reference_mode = "point"
-            if use_selected_line:
-                feedback.pushInfo("Use selected feature is ignored for point reference layers.")
+            if line_feature_id is not None or use_selected_line:
+                feedback.pushInfo("Line feature selection options are ignored for point reference layers.")
             if len(feats) not in (2, 3):
                 raise QgsProcessingException("Point reference layer must contain exactly 2 or 3 points (P1, P2, optional P3).")
 
@@ -387,7 +411,18 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             crs_origin_src = QgsPointXY(p1_src.x(), p1_src.y())
         elif _is_line_layer(layer):
             reference_mode = "line"
-            if use_selected_line:
+            if line_feature_id is not None:
+                reference_feat = layer.getFeature(line_feature_id)
+                if not reference_feat.isValid():
+                    raise QgsProcessingException(
+                        f"Reference line feature ID {line_feature_id} does not exist in the input layer."
+                    )
+                reference_feature_mode = "feature_id"
+                feedback.pushInfo(
+                    f"Using reference line feature ID {reference_feat.id()} "
+                    f"from a layer containing {len(feats)} features."
+                )
+            elif use_selected_line:
                 selected_feats = sorted(layer.selectedFeatures(), key=lambda f: f.id())
                 if len(selected_feats) != 1:
                     raise QgsProcessingException(
@@ -395,6 +430,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                         f"found {len(selected_feats)}."
                     )
                 reference_feat = selected_feats[0]
+                reference_feature_mode = "selection"
                 feedback.pushInfo(
                     f"Using selected line feature ID {reference_feat.id()} "
                     f"from a layer containing {len(feats)} features."
@@ -402,10 +438,12 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
             else:
                 if len(feats) != 1:
                     raise QgsProcessingException(
-                        "Line reference layer must contain exactly 1 line feature, or enable "
-                        "Use selected feature and select exactly one line in QGIS."
+                        "Line reference layer must contain exactly 1 line feature, or provide "
+                        "a reference feature ID, or enable Use selected feature and select "
+                        "exactly one line in QGIS."
                     )
                 reference_feat = feats[0]
+                reference_feature_mode = "single_feature"
 
             line = _single_line_from_feature(reference_feat)
             line_start_src = QgsPointXY(line[0])
@@ -512,6 +550,7 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "crs": src_crs.authid(),
                 "num_features": len(feats),
                 "use_selected_feature": bool(use_selected_line),
+                "reference_feature_mode": reference_feature_mode,
                 "reference_feature_id": int(reference_feat.id()),
                 "num_vertices": len(line),
                 "reverse_reference": bool(reverse_line),
@@ -793,6 +832,9 @@ class TrialPlotterAlgorithm(QgsProcessingAlgorithm):
                 "AUTO_N_COLS": bool(auto_n_cols),
                 "N_COLS": int(user_n_cols),
                 "N_ROWS": int(n_rows),
+                "REFERENCE_LINE_FEATURE_ID": (
+                    int(line_feature_id) if line_feature_id is not None else None
+                ),
                 "USE_SELECTED_LINE_FEATURE": bool(use_selected_line),
                 "REVERSE_REFERENCE": bool(reverse_line),
                 "START_OFFSET_M": float(start_offset),
